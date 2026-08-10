@@ -1,0 +1,57 @@
+{
+  "name": "@bulkhead/cli",
+  "version": "0.1.0",
+  "description": "Deterministic guardrails, evidence ledger, and budget hard-caps for AI coding agents. Installs into Claude Code hooks in one command. Containment and evidence \u2014 not a firewall.",
+  "license": "MIT",
+  "type": "module",
+  "bin": {
+    "bulkhead": "./dist/cli.js"
+  },
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/laqaer/bulkhead-cli.git"
+  },
+  "homepage": "https://github.com/laqaer/bulkhead-cli#readme",
+  "bugs": {
+    "url": "https://github.com/laqaer/bulkhead-cli/issues"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "keywords": [
+    "claude-code",
+    "ai-agents",
+    "guardrails",
+    "hooks",
+    "audit",
+    "safety",
+    "containment"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "npm run build && vitest run",
+    "test:watch": "vitest",
+    "prepublishOnly": "npm run build && vitest run"
+  },
+  "dependencies": {
+    "picomatch": "^4.0.2",
+    "yaml": "^2.6.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "@types/picomatch": "^3.0.1",
+    "typescript": "^5.7.0",
+    "vitest": "^3.0.0"
+  }
+}
