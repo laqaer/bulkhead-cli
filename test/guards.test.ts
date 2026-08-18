@@ -83,6 +83,97 @@ describe("blocked-commands guard", () => {
   it("denies DROP TABLE", () => {
     expect(blockedCommandsGuard(bash('psql -c "DROP TABLE users"'), policy).action).toBe("deny");
   });
+  // --- issue #2: content patterns fired on text that merely MENTIONS SQL ---
+  // https://github.com/laqaer/bulkhead/issues/2
+  it("allows text-only commands that merely mention destructive SQL", () => {
+    expect(blockedCommandsGuard(bash('echo "drop table"'), policy).action).toBe("allow");
+    expect(blockedCommandsGuard(bash('echo "DROP TABLE users"'), policy).action).toBe("allow");
+    expect(blockedCommandsGuard(bash('grep -r "drop table" ./docs'), policy).action).toBe("allow");
+    expect(blockedCommandsGuard(bash('rg "DROP DATABASE" src/'), policy).action).toBe("allow");
+    expect(blockedCommandsGuard(bash('cat migrations/README.md | grep -i "truncate table"'), policy).action).toBe("allow");
+  });
+
+  it("STILL denies real destructive SQL when a text command is in the pipeline", () => {
+    // The whole point of the whole-command rule: a per-segment skip would let
+    // these through, converting a false positive into a false negative.
+    expect(blockedCommandsGuard(bash('echo "DROP TABLE users" | psql'), policy).action).toBe("deny");
+    expect(blockedCommandsGuard(bash('echo "DROP TABLE users" | psql -d prod'), policy).action).toBe("deny");
+    expect(blockedCommandsGuard(bash('grep -i "drop table" x.sql && psql -c "DROP TABLE users"'), policy).action).toBe("deny");
+  });
+
+  it("does not treat command substitution or redirection as inert", () => {
+    // `echo` reads as harmless, but the substitution actually runs mkfs.
+    expect(blockedCommandsGuard(bash("echo $(mkfs.ext4 /dev/sda)"), policy).action).toBe("deny");
+    expect(blockedCommandsGuard(bash("echo `mkfs.ext4 /dev/sda`"), policy).action).toBe("deny");
+    // Writing the statement into a file is a side effect, not just printing.
+    expect(blockedCommandsGuard(bash('echo "DROP TABLE users" > wipe.sql'), policy).action).toBe("deny");
+  });
+
+  it("does not treat PROCESS substitution as inert", () => {
+    // `<(...)` is neither a pipe nor a quoted string, so a segment splitter
+    // reads `cat <(psql ...)` as a lone `cat` while the shell really does run
+    // the psql inside it. main denied these; the skip must not turn that into
+    // an allow.
+    expect(blockedCommandsGuard(bash('cat <(psql -c "DROP TABLE users")'), policy).action).toBe("deny");
+    expect(blockedCommandsGuard(bash('echo <(psql -c "DROP TABLE users")'), policy).action).toBe("deny");
+    expect(blockedCommandsGuard(bash('grep x <(psql -c "DROP TABLE users")'), policy).action).toBe("deny");
+    expect(blockedCommandsGuard(bash("cat <(mkfs.ext4 /dev/sda)"), policy).action).toBe("deny");
+  });
+
+  it("does not treat a bare & as a segment separator it can ignore", () => {
+    // A single `&` backgrounds the first command and runs the second. It is
+    // not one of the separators the splitter knows, so the whole string used
+    // to reduce to an inert `echo`.
+    expect(blockedCommandsGuard(bash('echo harmless & psql -c "DROP TABLE users"'), policy).action).toBe("deny");
+    expect(blockedCommandsGuard(bash('echo hi &psql -c "DROP TABLE users"'), policy).action).toBe("deny");
+  });
+
+  it("never skips a customer-authored rule, however inert the command looks", () => {
+    // The skip exists for the built-in prose-sensitive defaults only. If an
+    // operator bans `echo`, the guard does not get to overrule them.
+    const custom = { ...policy, blockedCommands: [{ pattern: "\\becho\\b", message: "no echo" }] };
+    expect(blockedCommandsGuard(bash("echo harmless"), custom).action).toBe("deny");
+    const secrets = { ...policy, blockedCommands: [{ pattern: "id_rsa", message: "no key reads" }] };
+    expect(blockedCommandsGuard(bash("cat ~/.ssh/id_rsa"), secrets).action).toBe("deny");
+  });
+
+  it("knows single quotes are literal but double quotes still substitute", () => {
+    // Double quotes do NOT make $(...) or backticks safe — the shell runs
+    // them — so a quoted substitution must never read as inert prose.
+    expect(blockedCommandsGuard(bash('echo "$(psql -c \'DROP TABLE users\')"'), policy).action).toBe("deny");
+    expect(blockedCommandsGuard(bash('echo "`psql -c \'DROP TABLE users\'`"'), policy).action).toBe("deny");
+    // Single quotes genuinely are literal, so this one stays allowed.
+    expect(blockedCommandsGuard(bash("echo 'DROP TABLE users $(whoami)'"), policy).action).toBe("allow");
+  });
+
+  it("requires a bare executable token, not a path basename", () => {
+    // `./echo` is a local script that can do anything; matching on the
+    // basename would let it inherit the allowlist.
+    expect(blockedCommandsGuard(bash('./echo "DROP TABLE users"'), policy).action).toBe("deny");
+    expect(blockedCommandsGuard(bash('/tmp/echo "DROP TABLE users"'), policy).action).toBe("deny");
+  });
+
+  it("rejects allowlisted text tools carrying an execution hook", () => {
+    expect(blockedCommandsGuard(bash('rg --pre=./run.sh "DROP TABLE"'), policy).action).toBe("deny");
+    expect(blockedCommandsGuard(bash('rg --pre ./run.sh "DROP TABLE"'), policy).action).toBe("deny");
+    // QUOTED options are still options. Deleting quoted tokens as "prose"
+    // hides the flag while the shell passes it to rg verbatim.
+    expect(blockedCommandsGuard(bash('rg "--pre=./run.sh" "DROP TABLE" src/'), policy).action).toBe("deny");
+    expect(blockedCommandsGuard(bash('rg "--pre" "./run.sh" "DROP TABLE" src/'), policy).action).toBe("deny");
+    // A leading assignment can arm a preprocessor without being an executable.
+    expect(blockedCommandsGuard(bash('LESSOPEN="|./x.sh %s" less "DROP TABLE users"'), policy).action).toBe("deny");
+    // Trimmed from the allowlist: pagers, sort (-o/--compress-program), yq -i.
+    expect(blockedCommandsGuard(bash('less "DROP TABLE users"'), policy).action).toBe("deny");
+    expect(blockedCommandsGuard(bash('sort --compress-program=./x.sh "DROP TABLE users"'), policy).action).toBe("deny");
+  });
+
+  it("treats an unrecognised executable as capable of executing (unknown ⇒ scan)", () => {
+    expect(blockedCommandsGuard(bash('somesqltool "DROP TABLE users"'), policy).action).toBe("deny");
+    // sed/awk are deliberately NOT inert — both can execute.
+    expect(blockedCommandsGuard(bash('sed -n "s/DROP TABLE/x/p" f.sql'), policy).action).toBe("deny");
+    expect(blockedCommandsGuard(bash('awk "/DROP TABLE/" f.sql'), policy).action).toBe("deny");
+  });
+
   it("denies rm targeting a filesystem root", () => {
     expect(blockedCommandsGuard(bash("rm -rf /"), policy).action).toBe("deny");
   });
