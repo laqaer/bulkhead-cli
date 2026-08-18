@@ -42,7 +42,8 @@
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "npm run build && vitest run",
     "test:watch": "vitest",
-    "prepublishOnly": "npm run build && vitest run"
+    "prepublishOnly": "npm run build && vitest run",
+    "prepare": "npm run build"
   },
   "dependencies": {
     "picomatch": "^4.0.2",
