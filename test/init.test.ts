@@ -68,17 +68,38 @@ describe("runInit", () => {
         },
       }),
     );
-    runInit(repo, { hookCommand: "npx --yes @bulkhead/cli hook" });
+    runInit(repo, { hookCommand: "npx --yes @bulkheadtools/cli hook" });
     const settings = JSON.parse(readFileSync(join(repo, ".claude", "settings.json"), "utf8"));
     const commands = settings.hooks.PreToolUse.flatMap((m: any) => m.hooks.map((h: any) => h.command));
     expect(commands).toContain("node /Users/me/bulkhead-tools/lint.js"); // user's hook survives
-    expect(commands).toContain("npx --yes @bulkhead/cli hook pre"); // ours added
+    expect(commands).toContain("npx --yes @bulkheadtools/cli hook pre"); // ours added
   });
 
-  it("strips a legacy @bulkhead/cli hook on re-init even without the marker", () => {
+  it("strips a legacy @bulkheadtools/cli hook on re-init even without the marker", () => {
     const repo = tempRepo();
     mkdirSync(join(repo, ".claude"), { recursive: true });
     // A pre-marker install: our command, but no bulkhead:true on the matcher.
+    writeFileSync(
+      join(repo, ".claude", "settings.json"),
+      JSON.stringify({
+        hooks: {
+          PreToolUse: [
+            { matcher: "*", hooks: [{ type: "command", command: "npx --yes @bulkheadtools/cli hook pre" }] },
+          ],
+        },
+      }),
+    );
+    runInit(repo, { hookCommand: "npx --yes @bulkheadtools/cli hook" });
+    const settings = JSON.parse(readFileSync(join(repo, ".claude", "settings.json"), "utf8"));
+    expect(settings.hooks.PreToolUse).toHaveLength(1); // deduped, not doubled
+  });
+
+  it("strips a pre-rename @bulkhead/cli hook on re-init", () => {
+    const repo = tempRepo();
+    mkdirSync(join(repo, ".claude"), { recursive: true });
+    // Installed while the package was still specced as @bulkhead/cli — the npm org
+    // `bulkhead` was taken, so it shipped as @bulkheadtools/cli. Anyone who ran init
+    // from the GitHub install form before the rename has this exact command.
     writeFileSync(
       join(repo, ".claude", "settings.json"),
       JSON.stringify({
@@ -89,9 +110,10 @@ describe("runInit", () => {
         },
       }),
     );
-    runInit(repo, { hookCommand: "npx --yes @bulkhead/cli hook" });
+    runInit(repo, { hookCommand: "npx --yes @bulkheadtools/cli hook" });
     const settings = JSON.parse(readFileSync(join(repo, ".claude", "settings.json"), "utf8"));
-    expect(settings.hooks.PreToolUse).toHaveLength(1); // deduped, not doubled
+    const commands = settings.hooks.PreToolUse.flatMap((m: any) => m.hooks.map((h: any) => h.command));
+    expect(commands).toEqual(["npx --yes @bulkheadtools/cli hook pre"]); // old spec gone, not doubled
   });
 
   it("upgrades the bulkhead command on re-init", () => {

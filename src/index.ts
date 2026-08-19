@@ -1,5 +1,5 @@
 /**
- * @bulkhead/cli — deterministic guardrails + evidence ledger for AI coding
+ * @bulkheadtools/cli — deterministic guardrails + evidence ledger for AI coding
  * agents. Public API surface (the CLI is the primary interface; these exports
  * exist for testing and for the hosted tiers to build on).
  */

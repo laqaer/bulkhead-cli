@@ -39,14 +39,23 @@ interface HookMatcher {
   bulkhead?: boolean;
 }
 
-// Legacy signal for hooks installed before matchers carried the `bulkhead: true`
-// marker. Deliberately specific (the published package spec) so we never strip a
-// user's own hook that merely references a path or script containing "bulkhead"
-// (e.g. `node /Users/me/bulkhead-tools/lint.js`).
-const LEGACY_COMMAND_MARKER = "@bulkhead/cli";
+// Legacy signals for hooks installed before matchers carried the `bulkhead: true`
+// marker. Each entry is a package spec only our own installer ever writes, so we
+// never strip a user's own hook that merely references a path or script
+// containing "bulkhead" (e.g. `node /Users/me/bulkhead-tools/lint.js`).
+//
+// `@bulkhead/cli` is the pre-rename spec: the npm org `bulkhead` was taken, so the
+// package ships as `@bulkheadtools/cli`. Anyone who ran `init` while the site
+// advertised the install-from-GitHub form has that older spec in their settings,
+// and re-init must still recognise and replace it.
+const LEGACY_COMMAND_MARKERS = ["@bulkheadtools/cli", "@bulkhead/cli"] as const;
+
+function isLegacyBulkheadCommand(command: unknown): boolean {
+  return typeof command === "string" && LEGACY_COMMAND_MARKERS.some((m) => command.includes(m));
+}
 
 export function runInit(repoRoot: string, opts: InitOptions = {}): InitResult {
-  const base = opts.hookCommand ?? "npx --yes @bulkhead/cli hook";
+  const base = opts.hookCommand ?? "npx --yes @bulkheadtools/cli hook";
 
   // 1. Policy file.
   const pPath = policyPath(repoRoot);
@@ -149,9 +158,10 @@ function asMatcherArray(v: unknown): HookMatcher[] {
  * Remove any Bulkhead-owned matcher so re-init never duplicates it. A matcher is
  * ours if it carries the `bulkhead: true` marker (the reliable signal) or — for
  * entries written by older versions that predate the marker — if one of its
- * commands references the published CLI spec `@bulkhead/cli`. We do NOT strip on
- * the bare word "bulkhead", so a user's own hook that points at a script or
- * directory named "bulkhead" is never silently deleted.
+ * commands references a published CLI spec we ship under (`@bulkheadtools/cli`, or
+ * the pre-rename `@bulkhead/cli`). We do NOT strip on the bare word "bulkhead", so
+ * a user's own hook that points at a script or directory named "bulkhead" is never
+ * silently deleted.
  */
 function stripBulkhead(matchers: HookMatcher[]): HookMatcher[] {
   return matchers
@@ -159,7 +169,7 @@ function stripBulkhead(matchers: HookMatcher[]): HookMatcher[] {
     .map((m) => ({
       ...m,
       hooks: (m.hooks ?? []).filter(
-        (h) => !(typeof h.command === "string" && h.command.includes(LEGACY_COMMAND_MARKER)),
+        (h) => !isLegacyBulkheadCommand(h.command),
       ),
     }))
     .filter((m) => m.hooks.length > 0);
