@@ -4,7 +4,7 @@
 tamper-evident evidence ledger for Claude Code, installed in one command.
 
 ```bash
-npx github:laqaer/bulkhead-cli init
+npx @bulkheadtools/cli init
 ```
 
 That's it. Bulkhead writes a `bulkhead.yaml` policy into your repo and wires

@@ -1,6 +1,6 @@
 {
   "name": "@bulkheadtools/cli",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Deterministic guardrails, evidence ledger, and budget hard-caps for AI coding agents. Installs into Claude Code hooks in one command. Containment and evidence \u2014 not a firewall.",
   "license": "MIT",
   "type": "module",
