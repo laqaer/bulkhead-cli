@@ -226,7 +226,8 @@ the left column.
   containment, not injection prevention.)
 - **Guarantee it runs.** Hooks fire because the host runs them. `claude --bare`
   skips hooks; anyone can uninstall them; a future Claude Code version could
-  change the contract. Bulkhead targets **Claude Code 2.1.86**'s hook API.
+  change the contract. This release is end-to-end verified with **Claude Code
+  2.1.232**.
 
 **Design choices that follow from this:**
 
@@ -242,11 +243,11 @@ the left column.
 
 ## Roadmap
 
-Bulkhead's OSS core (this package) is surface 1. Coming next: a completion
-verifier (did the tests it claimed actually run?), a paid **approval inbox** that
-pushes risk-ranked batches of risky-but-allowed actions to Telegram/Slack for
-overnight review, and a free public status page tracking pass-rate/cost per Claude
-Code release. More at [bulkhead.tools](https://bulkhead.tools).
+The OSS core already includes completion verification and a local, risk-ranked
+approval inbox. Next is the hosted **Pro** layer: remote approve-and-resume,
+team policy and ledger sync, a hosted audit dashboard, and overnight digests. A
+public compatibility suite will track pass rate and cost across Claude Code
+releases. More at [bulkhead.tools](https://bulkhead.tools).
 
 ---
 
