@@ -178,8 +178,12 @@ async function cmdHook(kind: string | undefined): Promise<number> {
     }
     return result.exitCode;
   } catch (err) {
-    // Any internal error fails OPEN: a bug in Bulkhead must not break the user's
-    // agent. The failure is loud (stderr) so it's noticed.
+    // Any internal error fails OPEN: a bug in Bulkhead must not break the
+    // user's agent. The failure is loud (stderr) so it's noticed.
+    // (The exceptions — an unwritable .bulkhead/ state dir, F2 — never reach
+    // this handler: handlePreToolUse converts StateDirUnavailableError into a
+    // deny verdict, and handleStop converts it into the Stop hook's blocking
+    // shape (F2b). Both are gate decisions; see hook.ts.)
     process.stderr.write(`bulkhead: hook error (failing open): ${String(err)}\n`);
     return 0;
   }

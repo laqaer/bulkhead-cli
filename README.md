@@ -226,8 +226,16 @@ the left column.
   containment, not injection prevention.)
 - **Guarantee it runs.** Hooks fire because the host runs them. `claude --bare`
   skips hooks; anyone can uninstall them; a future Claude Code version could
-  change the contract. This release is end-to-end verified with **Claude Code
-  2.1.232**.
+  change the contract. Bulkhead targets **Claude Code 2.1.86**'s hook API.
+- **Stop a hard link.** Protected-path matching resolves symlinks (a write
+  through `ln -s prod gate` is denied), but a hard link is a second directory
+  entry for the same inode — there is nothing for `realpath` to resolve, so
+  `ln .env hardcopy.conf` then writing `hardcopy.conf` is **allowed**. The
+  exposure is bounded: the OS refuses to hard-link a directory, so no new file
+  can appear inside a protected directory this way — only an already-existing
+  protected file can be modified. The write is still recorded in the ledger.
+  Tracked as https://github.com/laqaer/bulkhead-cli/issues/3 — pinned by
+  test so a fix cannot land silently.
 
 **Design choices that follow from this:**
 
@@ -235,19 +243,26 @@ the left column.
   tool call, your policy, the transcript, and loop state. Fast and reproducible.
 - **`allow` = abstain** — on a permitted call Bulkhead emits nothing, so Claude
   Code's own permission flow runs unchanged. It never auto-approves for you.
-- **Fail open, loudly** — if Bulkhead itself errors, the tool proceeds (a bug in a
-  guardrail must never brick your agent) and the error goes to stderr. A
+- **Fail open, loudly — with one deliberate exception.** If Bulkhead itself
+  errors, the tool proceeds (a bug in a guardrail must never brick your agent)
+  and the error goes to stderr. The exception is Bulkhead's own state directory
+  `.bulkhead/`: it *is* the enforcement substrate, and the guarded agent can
+  disable it with one mundane command (`chmod 000 .bulkhead`). A permission-class
+  failure there (`EACCES`, `EPERM`, `EROFS`) **fails closed** — the call is denied
+  with a message a human can act on. `ENOSPC` is not in that set on purpose: it
+  arrives unchosen and its blast radius is machine-wide
+  (https://github.com/laqaer/bulkhead-cli/issues/4). A broader
   fail-closed `strict` mode is planned.
 
 ---
 
 ## Roadmap
 
-The OSS core already includes completion verification and a local, risk-ranked
-approval inbox. Next is the hosted **Pro** layer: remote approve-and-resume,
-team policy and ledger sync, a hosted audit dashboard, and overnight digests. A
-public compatibility suite will track pass rate and cost across Claude Code
-releases. More at [bulkhead.tools](https://bulkhead.tools).
+Bulkhead's OSS core (this package) is surface 1. Coming next: a completion
+verifier (did the tests it claimed actually run?), a paid **approval inbox** that
+pushes risk-ranked batches of risky-but-allowed actions to Telegram/Slack for
+overnight review, and a free public status page tracking pass-rate/cost per Claude
+Code release. More at [bulkhead.tools](https://bulkhead.tools).
 
 ---
 

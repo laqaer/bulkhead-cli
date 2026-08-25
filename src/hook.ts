@@ -2,7 +2,8 @@ import { existsSync, readFileSync } from "node:fs";
 import type { Decision, HookInput, ToolCall } from "./types.js";
 import { atomicWrite } from "./fs-lock.js";
 import { loadPolicy } from "./policy.js";
-import { findRepoRoot, loopStatePath } from "./paths.js";
+import { bulkheadDir, findRepoRoot, loopStatePath } from "./paths.js";
+import { guardStateDir, isStateDirError } from "./state-dir.js";
 import {
   sessionCostFromTranscript,
   rollupDailySpend,
@@ -44,8 +45,39 @@ export interface HookResult {
   exitCode: number;
 }
 
-/** Full PreToolUse handling, minus stdin/stdout plumbing (that's in the CLI). */
+/**
+ * PreToolUse entrypoint. F2: this is the one handler whose verdict IS the
+ * gate, so it owns its failure posture — a StateDirUnavailableError (the
+ * .bulkhead/ substrate being unwritable) converts to an explicit DENY with a
+ * human-actionable reason instead of escaping to cli.ts's fail-open catch.
+ * Every other error still escapes and fails open, exactly as before. The post
+ * handler is deliberately not wrapped (see handlePostToolUse): it makes no
+ * gate decision, so failing open there cannot un-guard an action. The stop
+ * handler DOES gate — it verifies completion claims against ledger evidence —
+ * so it carries its own state-dir conversion in handleStop (F2b).
+ */
 export function handlePreToolUse(input: HookInput, now: Date = new Date()): HookResult {
+  try {
+    return preToolUseVerdict(input, now);
+  } catch (err) {
+    if (!isStateDirError(err)) throw err;
+    const verdict = {
+      action: "deny" as const,
+      guard: "state-dir",
+      rule: err.fsCode,
+      reason: err.message,
+    };
+    return renderDecision({
+      action: "deny",
+      verdicts: [verdict],
+      deciding: verdict,
+      reason: err.message,
+    });
+  }
+}
+
+function preToolUseVerdict(input: HookInput, now: Date): HookResult {
+  // Full PreToolUse handling; stdin/stdout plumbing is in cli.ts.
   const cwd = typeof input.cwd === "string" ? input.cwd : process.cwd();
   const repoRoot = findRepoRoot(cwd);
   const policy = loadPolicy(repoRoot);
@@ -61,9 +93,19 @@ export function handlePreToolUse(input: HookInput, now: Date = new Date()): Hook
 
   // Cost: recompute session total from the transcript, refresh the daily
   // rollup, read back today's aggregate. Deterministic sum, no estimation.
+  //
+  // F2: the writes below land in <repoRoot>/.bulkhead/ — the enforcement
+  // substrate itself. A permission failure there (the guarded agent can cause
+  // one with `chmod 000 .bulkhead`) is rethrown as StateDirUnavailableError,
+  // which the handlePreToolUse wrapper above converts into an explicit deny.
+  // Everything else still propagates to cli.ts's historical fail-open
+  // handler. The transcript read is deliberately NOT wrapped — it is a
+  // host-owned input, not our substrate.
   const session = sessionCostFromTranscript(input.transcript_path, policy.budget.pricing);
   const today = localDateString(now);
-  const dayUsd = rollupDailySpend(repoRoot, sessionId, session.totalUsd, today);
+  const dayUsd = guardStateDir(bulkheadDir(repoRoot), () =>
+    rollupDailySpend(repoRoot, sessionId, session.totalUsd, today),
+  );
   const cost = buildCostBreakdown(session, dayUsd);
 
   // Loop: load persisted state, run the pure check, persist the next state.
@@ -75,7 +117,7 @@ export function handlePreToolUse(input: HookInput, now: Date = new Date()): Hook
     now.getTime(),
     policy.loop,
   );
-  writeLoopState(repoRoot, nextState);
+  guardStateDir(bulkheadDir(repoRoot), () => writeLoopState(repoRoot, nextState));
 
   // Risk is scored for every action; the guard only turns it into an `ask` in
   // `ask` mode. Recorded on the ledger regardless so `record` mode and the
@@ -84,20 +126,22 @@ export function handlePreToolUse(input: HookInput, now: Date = new Date()): Hook
   const decision = evaluate(call, policy, cost, loopVerdict, risk);
 
   // Record every interception to the evidence ledger, decision included.
-  appendLedger(repoRoot, {
-    ts: now.toISOString(),
-    sessionId,
-    promptId: firstString(input.prompt_id),
-    event: "pre",
-    toolName: call.toolName,
-    toolInput: call.toolInput,
-    action: decision.action,
-    guard: decision.deciding?.guard,
-    rule: decision.deciding?.rule,
-    reason: decision.reason,
-    cost: { sessionUsd: cost.sessionUsd, dayUsd: cost.dayUsd },
-    risk: risk.level ? risk : undefined,
-  });
+  guardStateDir(bulkheadDir(repoRoot), () =>
+    appendLedger(repoRoot, {
+      ts: now.toISOString(),
+      sessionId,
+      promptId: firstString(input.prompt_id),
+      event: "pre",
+      toolName: call.toolName,
+      toolInput: call.toolInput,
+      action: decision.action,
+      guard: decision.deciding?.guard,
+      rule: decision.deciding?.rule,
+      reason: decision.reason,
+      cost: { sessionUsd: cost.sessionUsd, dayUsd: cost.dayUsd },
+      risk: risk.level ? risk : undefined,
+    }),
+  );
 
   return renderDecision(decision);
 }
@@ -146,12 +190,36 @@ export interface StopOutput {
 }
 
 /**
- * Stop: completion verification. Compares checkable claims in the agent's final
- * message against the session's ledger evidence. `stop_hook_active` guards
- * against block loops: when the host says this stop already resulted from a
- * prior blocked stop, we never block again — verdicts are recorded only.
+ * Stop entrypoint. F2b: the stop hook IS a gate — it verifies the agent's
+ * completion claims against ledger evidence, so it owns its failure posture
+ * exactly like handlePreToolUse. Its state-dir appends (spend rollup, ledger
+ * entry) are wrapped in guardStateDir; a StateDirUnavailableError converts
+ * into the Stop hook's own blocking shape ({decision:"block"}) rather than a
+ * PreToolUse permissionDecision deny, because Claude Code reads Stop output
+ * under the top-level decision schema. Every other error still escapes and
+ * fails open. The post handler stays unwrapped: it makes no gate decision, so
+ * failing open there cannot wave an action or a false completion claim
+ * through.
  */
 export function handleStop(input: HookInput, now: Date = new Date()): HookResult {
+  try {
+    return stopVerdict(input, now);
+  } catch (err) {
+    if (!isStateDirError(err)) throw err;
+    // Deliberately NOT suppressed by stop_hook_active: if a retried stop
+    // (one that already followed a blocked stop) suppressed this block, the
+    // guarded agent would escape by stopping twice. The substrate is gone —
+    // there is no ledger to record a suppressed verdict in anyway. Cost of
+    // failing closed here: the turn cannot end until a human restores access,
+    // which is exactly what the reason string asks for.
+    return {
+      output: { decision: "block", reason: err.message } satisfies StopOutput,
+      exitCode: 0,
+    };
+  }
+}
+
+function stopVerdict(input: HookInput, now: Date): HookResult {
   const cwd = typeof input.cwd === "string" ? input.cwd : process.cwd();
   const repoRoot = findRepoRoot(cwd);
   const policy = loadPolicy(repoRoot);
@@ -161,8 +229,12 @@ export function handleStop(input: HookInput, now: Date = new Date()): HookResult
   // turn's final model call, which no Pre/PostToolUse hook ever sees — without
   // this, that call's cost is dropped from the session total and daily rollup,
   // and would be misattributed to the NEXT prompt in per-prompt reports.
+  // F2b: this write lands in .bulkhead/ — wrapped, so an unwritable substrate
+  // blocks instead of silently allowing the stop.
   const session = sessionCostFromTranscript(input.transcript_path, policy.budget.pricing);
-  const dayUsd = rollupDailySpend(repoRoot, sessionId, session.totalUsd, localDateString(now));
+  const dayUsd = guardStateDir(bulkheadDir(repoRoot), () =>
+    rollupDailySpend(repoRoot, sessionId, session.totalUsd, localDateString(now)),
+  );
   const cost = { sessionUsd: session.totalUsd, dayUsd };
 
   if (policy.verify.mode === "off") {
@@ -174,26 +246,31 @@ export function handleStop(input: HookInput, now: Date = new Date()): HookResult
   const evidence = sessionEvidence(readLedger(repoRoot), sessionId);
   const assessment = assessStop(finalMessage, evidence, policy.verify);
 
+  // Loop guard for the verify guard itself: when this stop already followed a
+  // blocked stop, record the verdict only — never block again. (The F2b
+  // state-dir failure above deliberately does NOT honour this guard.)
   const stopHookActive = input.stop_hook_active === true;
   const blocking = assessment.shouldBlock && !stopHookActive;
 
-  appendLedger(repoRoot, {
-    ts: now.toISOString(),
-    sessionId,
-    promptId: firstString(input.prompt_id),
-    event: "stop",
-    action: blocking ? "deny" : "allow",
-    guard: assessment.verdicts.length > 0 ? "verify" : undefined,
-    reason: blocking ? assessment.blockReason : undefined,
-    cost,
-    meta: {
-      verdicts: assessment.verdicts,
-      stopHookActive,
-      ...(assessment.shouldBlock && stopHookActive
-        ? { note: "block suppressed: stop_hook_active (loop guard)" }
-        : {}),
-    },
-  });
+  guardStateDir(bulkheadDir(repoRoot), () =>
+    appendLedger(repoRoot, {
+      ts: now.toISOString(),
+      sessionId,
+      promptId: firstString(input.prompt_id),
+      event: "stop",
+      action: blocking ? "deny" : "allow",
+      guard: assessment.verdicts.length > 0 ? "verify" : undefined,
+      reason: blocking ? assessment.blockReason : undefined,
+      cost,
+      meta: {
+        verdicts: assessment.verdicts,
+        stopHookActive,
+        ...(assessment.shouldBlock && stopHookActive
+          ? { note: "block suppressed: stop_hook_active (loop guard)" }
+          : {}),
+      },
+    }),
+  );
 
   if (blocking) {
     return {
