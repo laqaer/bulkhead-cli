@@ -36,6 +36,11 @@ function denyDecision(result: PreResult): string | undefined {
   return out?.hookSpecificOutput?.permissionDecision;
 }
 
+function denialReason(result: PreResult): string {
+  const out = result.output as { hookSpecificOutput?: { permissionDecisionReason?: string } };
+  return out?.hookSpecificOutput?.permissionDecisionReason ?? "";
+}
+
 function initRepo(): string {
   const repo = tempRepo();
   runInit(repo, {});
@@ -146,6 +151,29 @@ describe("state-dir fail-closed (F2, in-process hook)", () => {
       // Pre-fix this threw raw EACCES out of handlePreToolUse and cli.ts
       // failed open. Post-fix the handler returns a deny verdict itself.
       expect(denyDecision(handlePreToolUse(protectedWriteCall(repo)))).toBe("deny");
+    } finally {
+      chmodSync(join(repo, ".bulkhead"), 0o755);
+      rmSync(repo, { recursive: true, force: true });
+    }
+  });
+
+  it("state-dir denial points at restoring access, NOT at editing bulkhead.yaml", () => {
+    if (skipOnRoot) return;
+    const repo = initRepo();
+    try {
+      chmodSync(join(repo, ".bulkhead"), 0o000);
+      const result = handlePreToolUse(protectedWriteCall(repo));
+      expect(denyDecision(result)).toBe("deny");
+      const reason = denialReason(result);
+      // The generic footer ("a human must change bulkhead.yaml or perform this
+      // action manually") is wrong for this guard: no policy edit restores an
+      // unwritable .bulkhead/, so the footer would send the human to a remedy
+      // that cannot work. The Why line already names the real fix; the refusal
+      // must direct the human at restoring filesystem access instead. Every
+      // OTHER guard keeps the generic footer — policy edits ARE their remedy.
+      expect(reason).not.toContain("change bulkhead.yaml");
+      expect(reason).toContain("restore access");
+      expect(reason).toContain(".bulkhead");
     } finally {
       chmodSync(join(repo, ".bulkhead"), 0o755);
       rmSync(repo, { recursive: true, force: true });

@@ -40,6 +40,13 @@ our own shipped artifact, not reported by a user.
   blocking shape, and deliberately ignores `stop_hook_active` — suppressing the
   block on retry would restore the bypass.
 
+- **The state-dir denial pointed the human at the wrong remedy.** The generic
+  refusal footer says "a human must change bulkhead.yaml", which is right for a
+  policy guard and wrong for this one — no policy edit restores an unwritable
+  `.bulkhead/`. The state-dir refusal now names restoring filesystem access and
+  says explicitly that editing `bulkhead.yaml` will not help, so the footer
+  cannot contradict the `Why` line directly above it.
+
 ### Deliberately not changed
 
 - **`ENOSPC` still fails open.** It has the same silent-off-switch outcome, but
@@ -64,6 +71,6 @@ our own shipped artifact, not reported by a user.
 
 ### Tests
 
-`packages/core` 283 tests, 18 files. The integration suites drive the shipped
+`packages/core` 284 tests, 18 files. The integration suites drive the shipped
 binary through the real Claude Code hook protocol rather than calling the guard
 functions directly.
