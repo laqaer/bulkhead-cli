@@ -1,0 +1,75 @@
+# Publishes @bulkheadtools/cli to npm with SLSA build provenance.
+#
+# RT-003b (red team audit 2026-08-22): published releases shipped from local
+# machines with no provenance attestations. This workflow makes GitHub Actions
+# the only publish path and attaches npm provenance to every release.
+#
+# Authentication uses npm trusted publishing (OIDC) — NO secrets are stored in
+# this repository. One-time founder setup on npmjs.com is required first:
+# configure @bulkheadtools/cli's trusted publisher as owner `laqaer`,
+# repository `bulkhead-cli`, workflow file `publish.yml`. Until that is done,
+# publishes will fail with 4xx from the registry rather than fall back to a
+# long-lived token.
+#
+# Manual runs (workflow_dispatch) are a dry-run: they install and build but
+# never publish. Publishing happens only when a GitHub Release is published,
+# and only when the release tag matches package.json's version.
+# Note: prepublishOnly (`npm run build && vitest run`) still executes during
+# `npm publish`, so tests gate every publish.
+
+name: Publish
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write # REQUIRED for OIDC trusted publishing / --provenance
+
+concurrency:
+  group: publish-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: Build, verify, and publish with provenance
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+
+      - name: Setup Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 20 # engines: node >=20; no .nvmrc in repo
+          registry-url: https://registry.npmjs.org
+
+      # Trusted publishing (tokenless OIDC auth) needs npm >= 11.5.0;
+      # Node 20 ships an older npm, so upgrade before publishing.
+      - name: Upgrade npm for trusted publishing support
+        run: npm install -g npm@latest
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build
+        run: npm run build
+
+      - name: Verify release tag matches package.json version
+        if: github.event_name == 'release'
+        run: |
+          pkg_version="$(node -p "require('./package.json').version")"
+          tag_version="${GITHUB_REF_NAME#v}"
+          echo "release tag ${GITHUB_REF_NAME} -> ${tag_version}; package.json -> ${pkg_version}"
+          if [ "${tag_version}" != "${pkg_version}" ]; then
+            echo "::error::Release tag '${GITHUB_REF_NAME}' does not match package.json version '${pkg_version}' - refusing to publish."
+            exit 1
+          fi
+
+      - name: Publish to npm with provenance
+        if: github.event_name == 'release'
+        run: npm publish --provenance
