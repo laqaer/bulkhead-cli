@@ -37,10 +37,10 @@ export class StateDirUnavailableError extends Error {
     const code = (cause as NodeJS.ErrnoException | null)?.code ?? "UNKNOWN";
     const fix =
       code === "ENOSPC"
-        ? "Free blocks or inodes on the filesystem containing .bulkhead/, then retry."
+        ? "free blocks or inodes on the filesystem containing .bulkhead/, then retry."
         : code === "EROFS"
-          ? "Restore a writable mount for .bulkhead/, then retry."
-          : "Restore access to .bulkhead/ (for example, `chmod u+rwx .bulkhead`), then retry.";
+          ? "restore a writable mount for .bulkhead/, then retry."
+          : "restore access to .bulkhead/ (for example, `chmod u+rwx .bulkhead`), then retry.";
     super(
       `Bulkhead state directory \`${path}\` is not writable (${code}). ` +
         `Enforcement cannot load or record evidence, so this action is denied. ` +

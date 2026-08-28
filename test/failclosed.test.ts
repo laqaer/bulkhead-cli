@@ -112,7 +112,7 @@ describe("state-dir error classification (F2 internals)", () => {
     }
     expect(caught).toBeInstanceOf(StateDirUnavailableError);
     expect((caught as StateDirUnavailableError).fsCode).toBe("ENOSPC");
-    expect((caught as Error).message).toContain("Free blocks or inodes");
+    expect((caught as Error).message).toContain("free blocks or inodes");
     expect((caught as Error).message).not.toContain("chmod");
   });
 
