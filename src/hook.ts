@@ -95,9 +95,10 @@ function preToolUseVerdict(input: HookInput, now: Date): HookResult {
   // rollup, read back today's aggregate. Deterministic sum, no estimation.
   //
   // F2: the writes below land in <repoRoot>/.bulkhead/ — the enforcement
-  // substrate itself. A permission failure there (the guarded agent can cause
-  // one with `chmod 000 .bulkhead`) is rethrown as StateDirUnavailableError,
-  // which the handlePreToolUse wrapper above converts into an explicit deny.
+  // substrate itself. A named availability failure there (the guarded agent
+  // can cause one by removing access or exhausting capacity) is rethrown as
+  // StateDirUnavailableError, which the handlePreToolUse wrapper above
+  // converts into an explicit deny.
   // Everything else still propagates to cli.ts's historical fail-open
   // handler. The transcript read is deliberately NOT wrapped — it is a
   // host-owned input, not our substrate.

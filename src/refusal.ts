@@ -18,12 +18,12 @@ export function formatRefusal(verdict: GuardVerdict): string {
   );
   // The generic footer tells the reader to change bulkhead.yaml — the right
   // remedy for a policy guard, and the WRONG one for the state-dir guard: no
-  // policy edit restores an unwritable .bulkhead/, only restoring filesystem
-  // access does. The state-dir Why line names the exact command; the footer
-  // must not contradict it.
+  // policy edit restores an unavailable .bulkhead/, only restoring its
+  // filesystem access or capacity does. The state-dir Why line names the exact
+  // fix; the footer must not contradict it.
   lines.push(
     verdict.guard === "state-dir"
-      ? "To proceed, a human must restore access to the .bulkhead directory (the Why line above names the exact fix) — editing bulkhead.yaml will not help."
+      ? "To proceed, a human must restore .bulkhead state storage using the fix above — editing bulkhead.yaml will not help."
       : "To proceed, a human must change bulkhead.yaml or perform this action manually.",
   );
   return lines.join("\n");

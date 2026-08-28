@@ -243,16 +243,16 @@ the left column.
   tool call, your policy, the transcript, and loop state. Fast and reproducible.
 - **`allow` = abstain** — on a permitted call Bulkhead emits nothing, so Claude
   Code's own permission flow runs unchanged. It never auto-approves for you.
-- **Fail open, loudly — with one deliberate exception.** If Bulkhead itself
-  errors, the tool proceeds (a bug in a guardrail must never brick your agent)
-  and the error goes to stderr. The exception is Bulkhead's own state directory
-  `.bulkhead/`: it *is* the enforcement substrate, and the guarded agent can
-  disable it with one mundane command (`chmod 000 .bulkhead`). A permission-class
-  failure there (`EACCES`, `EPERM`, `EROFS`) **fails closed** — the call is denied
-  with a message a human can act on. `ENOSPC` is not in that set on purpose: it
-  arrives unchosen and its blast radius is machine-wide
-  (https://github.com/laqaer/bulkhead-cli/issues/4). A broader
-  fail-closed `strict` mode is planned.
+- **Fail open by default, with named state-substrate exceptions.** If Bulkhead
+  hits an ordinary internal error, the tool proceeds (a bug in a guardrail must
+  never brick your agent) and the error goes to stderr. Bulkhead's own state
+  directory `.bulkhead/` is different: it *is* the enforcement substrate, and
+  losing it disables both the guards and their audit trail. Failures that make
+  that storage unavailable (`EACCES`, `EPERM`, `EROFS`, `ENOSPC`) **fail closed**
+  — the call is denied with a message a human can act on. `ENOSPC` is included
+  because capacity exhaustion can be accidental or agent-induced and may be
+  scoped to the state filesystem; a human must free blocks or inodes before the
+  guarded agent continues. A broader fail-closed `strict` mode is planned.
 
 ---
 
