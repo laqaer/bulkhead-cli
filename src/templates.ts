@@ -14,23 +14,30 @@ version: 1
 # Paths the agent may never write or delete. Globs are matched against the
 # repo-relative path (dotfiles included). Reliable for file tools (Write/Edit);
 # for Bash, only the obvious 'rm <protected>' case is caught.
+#
+# The baseline rules below are always enforced. Custom deny rules are additive,
+# and allow exceptions cannot exempt bulkhead.yaml or .bulkhead/** — an agent
+# must never be able to rewrite its own guardrail or evidence state.
 protected_paths:
   deny:
     - "prod/**"
     - "migrations/**"
     - ".env"
     - ".env.*"
-    # Bulkhead's own evidence — the agent must not edit its own audit trail.
+    # Bulkhead's policy and evidence/state are immutable to the guarded agent.
+    - "bulkhead.yaml"
+    - ".bulkhead"
     - ".bulkhead/**"
-  allow: []   # exceptions carved back out of deny
+  allow: []   # exceptions carved back out of configurable deny paths
 
 # Bash commands blocked by regex (case-insensitive, matched against the whole
 # command). Regex is bypassable by design — this catches fat-finger and
-# copy-paste disasters, not a determined adversary. Two structured checks also
-# run built-in (not regexes): 'rm' targeting anything outside the workspace, and
-# a dangerous force-push (order-independent; blocks force-push to main/master and
-# unconditional force-push, but allows --force-with-lease and force-pushing a
-# feature branch merely named '*-main').
+# copy-paste disasters, not a determined adversary. Built-in command rules are
+# always retained; entries here add stricter project-specific rules.
+# Two structured checks also run built-in (not regexes): 'rm' targeting anything
+# outside the workspace, and a dangerous force-push (order-independent; blocks
+# force-push to main/master and unconditional force-push, but allows
+# --force-with-lease and force-pushing a feature branch merely named '*-main').
 blocked_commands:
   - pattern: "\\\\bDROP\\\\s+TABLE\\\\b"
     message: "SQL DROP TABLE"
