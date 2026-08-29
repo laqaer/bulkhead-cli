@@ -112,6 +112,36 @@ export interface Policy {
 }
 
 /**
+ * These paths protect the guardrail itself. They are evaluated before user
+ * allow exceptions, so an agent cannot carve them back out through policy.
+ */
+export const IMMUTABLE_PROTECTED_PATHS = [
+  "bulkhead.yaml",
+  ".bulkhead",
+  ".bulkhead/**",
+] as const;
+
+const BUILTIN_PROTECTED_PATHS = [
+  "prod/**",
+  "migrations/**",
+  ".env",
+  ".env.*",
+  ...IMMUTABLE_PROTECTED_PATHS,
+] as const;
+
+const BUILTIN_BLOCKED_COMMANDS: ReadonlyArray<BlockedCommandRule> = [
+  { pattern: "\\bDROP\\s+TABLE\\b", message: "SQL DROP TABLE" },
+  { pattern: "\\bDROP\\s+DATABASE\\b", message: "SQL DROP DATABASE" },
+  { pattern: "\\bTRUNCATE\\s+TABLE\\b", message: "SQL TRUNCATE TABLE" },
+  { pattern: "\\bmkfs\\.[a-z0-9]+\\b", message: "Filesystem format" },
+  {
+    pattern: "\\b(curl|wget)\\b[^\\n]*\\|[^\\n]*\\b(sh|bash|zsh)\\b",
+    message: "Piping a downloaded script straight into a shell",
+  },
+  { pattern: ":\\(\\)\\s*\\{\\s*:\\|:&\\s*\\};:", message: "Fork bomb" },
+];
+
+/**
  * Conservative defaults. False positives get a tool ripped out within a week,
  * so the shipped policy blocks only unambiguously destructive things.
  */
@@ -120,20 +150,12 @@ export function defaultPolicy(workspaceRoot: string): Policy {
     version: 1,
     workspaceRoot,
     protectedPaths: {
-      // ".bulkhead/**": the agent must not edit its own audit trail.
-      deny: ["prod/**", "migrations/**", ".env", ".env.*", ".bulkhead/**"],
+      deny: [...BUILTIN_PROTECTED_PATHS],
       allow: [],
     },
     // Note: dangerous force-push is handled by a built-in structured check
     // (order-independent, branch-precise) — not by a regex here.
-    blockedCommands: [
-      { pattern: "\\bDROP\\s+TABLE\\b", message: "SQL DROP TABLE" },
-      { pattern: "\\bDROP\\s+DATABASE\\b", message: "SQL DROP DATABASE" },
-      { pattern: "\\bTRUNCATE\\s+TABLE\\b", message: "SQL TRUNCATE TABLE" },
-      { pattern: "\\bmkfs\\.[a-z0-9]+\\b", message: "Filesystem format" },
-      { pattern: "\\b(curl|wget)\\b[^\\n]*\\|[^\\n]*\\b(sh|bash|zsh)\\b", message: "Piping a downloaded script straight into a shell" },
-      { pattern: ":\\(\\)\\s*\\{\\s*:\\|:&\\s*\\};:", message: "Fork bomb" },
-    ],
+    blockedCommands: BUILTIN_BLOCKED_COMMANDS.map((rule) => ({ ...rule })),
     budget: {
       sessionUsd: 5,
       dailyUsd: 20,
@@ -154,7 +176,12 @@ export function defaultPolicy(workspaceRoot: string): Policy {
   };
 }
 
-/** Deep-ish merge of a parsed YAML object onto the defaults. */
+/**
+ * Merge parsed YAML onto the defaults without allowing policy to dismantle the
+ * guardrail that is loading it. User deny/command rules are additive, the
+ * workspace root always comes from the hook's discovered repo root, and the
+ * immutable self-protection paths remain enforced even when listed in allow.
+ */
 export function normalizePolicy(raw: unknown, workspaceRoot: string): Policy {
   const base = defaultPolicy(workspaceRoot);
   if (!raw || typeof raw !== "object") return base;
@@ -171,15 +198,18 @@ export function normalizePolicy(raw: unknown, workspaceRoot: string): Policy {
 
   return {
     version: typeof r.version === "number" ? r.version : base.version,
-    workspaceRoot:
-      typeof (r.workspace_root ?? r.workspaceRoot) === "string"
-        ? (r.workspace_root ?? r.workspaceRoot) as string
-        : base.workspaceRoot,
+    // Never trust a repository policy to redefine the boundary that contains
+    // it. findRepoRoot() supplies the root; YAML may not move it elsewhere.
+    workspaceRoot: base.workspaceRoot,
     protectedPaths: {
-      deny: asStringArray(pp?.deny) ?? base.protectedPaths.deny,
+      deny: mergeStrings(base.protectedPaths.deny, asStringArray(pp?.deny) ?? []),
       allow: asStringArray(pp?.allow) ?? base.protectedPaths.allow,
     },
-    blockedCommands: normalizeBlocked(blocked) ?? base.blockedCommands,
+    // Custom patterns extend the baseline; they cannot replace it with [].
+    blockedCommands: mergeBlockedRules(
+      base.blockedCommands,
+      normalizeBlocked(blocked) ?? [],
+    ),
     budget: {
       sessionUsd: asNumber(budget?.session_usd ?? budget?.sessionUsd) ?? base.budget.sessionUsd,
       dailyUsd: asNumber(budget?.daily_usd ?? budget?.dailyUsd) ?? base.budget.dailyUsd,
@@ -204,6 +234,24 @@ export function normalizePolicy(raw: unknown, workspaceRoot: string): Policy {
       minLevel: asRiskLevel(risky?.min_level ?? risky?.minLevel) ?? base.risky.minLevel,
     },
   };
+}
+
+function mergeStrings(base: string[], extra: string[]): string[] {
+  return [...new Set([...base, ...extra])];
+}
+
+function mergeBlockedRules(
+  base: BlockedCommandRule[],
+  extra: BlockedCommandRule[],
+): BlockedCommandRule[] {
+  const seen = new Set<string>();
+  const merged: BlockedCommandRule[] = [];
+  for (const rule of [...base, ...extra]) {
+    if (seen.has(rule.pattern)) continue;
+    seen.add(rule.pattern);
+    merged.push({ ...rule });
+  }
+  return merged;
 }
 
 function asRiskyMode(v: unknown): RiskyConfig["mode"] | undefined {
