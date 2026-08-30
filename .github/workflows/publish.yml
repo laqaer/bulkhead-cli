@@ -11,11 +11,13 @@
 # publishes will fail with 4xx from the registry rather than fall back to a
 # long-lived token.
 #
-# Manual runs (workflow_dispatch) are a dry-run: they install and build but
-# never publish. Publishing happens only when a GitHub Release is published,
-# and only when the release tag matches package.json's version.
+# Manual runs (workflow_dispatch) are a dry-run: they install, build, and smoke
+# the exact package tarball but never publish. Publishing happens only when a
+# GitHub Release is published, and only when the release tag matches
+# package.json's version. The clean-install smoke runs inside this job, so a
+# release cannot bypass the package-level gate.
 # Note: prepublishOnly (`npm run build && vitest run`) still executes during
-# `npm publish`, so tests gate every publish.
+# `npm publish`, so tests gate every publish as well.
 
 name: Publish
 
@@ -56,6 +58,9 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      - name: Audit production dependency tree
+        run: npm audit --omit=dev --audit-level=high
+
       - name: Build
         run: npm run build
 
@@ -69,6 +74,17 @@ jobs:
             echo "::error::Release tag '${GITHUB_REF_NAME}' does not match package.json version '${pkg_version}' - refusing to publish."
             exit 1
           fi
+
+      - name: Pack and install exactly what npm would receive
+        run: |
+          set -euo pipefail
+          tarball="$(npm pack --silent)"
+          test -f "$tarball"
+          work="$(mktemp -d)"
+          cd "$work"
+          npm init -y >/dev/null
+          npm install --no-audit --no-fund "$GITHUB_WORKSPACE/$tarball"
+          npx --no-install bulkhead --help >/dev/null
 
       - name: Publish to npm with provenance
         if: github.event_name == 'release'
