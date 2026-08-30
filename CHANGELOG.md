@@ -3,6 +3,23 @@
 This file starts at 0.1.3. Earlier releases (0.1.0 – 0.1.2) predate it; their
 contents are recoverable from the git history, not summarised here.
 
+## Unreleased
+
+### Changed
+
+- **`ENOSPC` now fails closed for Bulkhead state writes.** Capacity exhaustion
+  makes `.bulkhead/` unavailable just like a permission or read-only-filesystem
+  failure: enforcement cannot finish evaluating the call and the evidence
+  ledger cannot record it. PreToolUse now denies and Stop blocks until a human
+  frees blocks or inodes, while unrelated errnos keep the historical fail-open
+  behaviour. The refusal names the capacity fix instead of suggesting `chmod`.
+
+### Tests
+
+- The named fail-closed errno table now pins `ENOSPC`, with `EIO`, `EMFILE`, and
+  `ENOENT` retained as explicit fail-open controls and a focused assertion for
+  the capacity-specific remediation.
+
 ## 0.1.3 — 2026-08-25
 
 Security release. Three ways to walk a write past the protected-path guard, and

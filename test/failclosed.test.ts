@@ -13,12 +13,11 @@ import { tempRepo } from "./helpers.js";
 import { runInit } from "../src/init.js";
 
 // F2: any error inside the pre-hook failed OPEN — silently allowing the call.
-// When the failing thing is Bulkhead's own state directory (EACCES/EPERM on
-// .bulkhead/), that error is not transient: it IS the enforcement substrate
-// being removed (the guarded agent can cause it with `chmod 000 .bulkhead`).
-// A state-dir permission failure must fail CLOSED with a human-actionable
-// reason. Everything else keeps today's fail-open behaviour (documented in
-// the PR body — a deliberate choice, not an omission).
+// When the failing thing is Bulkhead's own state directory, named availability
+// failures are not ordinary guard bugs: they remove the enforcement substrate.
+// The guarded agent can cause them by removing access or exhausting capacity.
+// Those failures must fail CLOSED with a human-actionable reason. Everything
+// outside the enumerated policy keeps today's fail-open behaviour.
 //
 // F2b: the Stop hook is a gate too. It verifies the agent's completion claims
 // against ledger evidence, and its own state-dir appends used to escape to
@@ -82,10 +81,27 @@ describe("state-dir error classification (F2 internals)", () => {
   });
 
   // Each fail-closed errno gets its own assertion so the policy is enumerated,
-  // not implied. EROFS joins EACCES/EPERM: a read-only filesystem is exactly
-  // as persistent and human-actionable as a permission failure.
-  it.each(["EACCES", "EPERM", "EROFS"])("wraps %s into StateDirUnavailableError", (code) => {
-    const boom = Object.assign(new Error(`boom ${code}`), { code });
+  // not implied. These all make the enforcement substrate unavailable until a
+  // human restores access or capacity.
+  it.each(["EACCES", "EPERM", "EROFS", "ENOSPC"])(
+    "wraps %s into StateDirUnavailableError",
+    (code) => {
+      const boom = Object.assign(new Error(`boom ${code}`), { code });
+      let caught: unknown;
+      try {
+        guardStateDir("/repo/.bulkhead", () => {
+          throw boom;
+        });
+      } catch (e) {
+        caught = e;
+      }
+      expect(isStateDirError(caught)).toBe(true);
+      expect((caught as StateDirUnavailableError).fsCode).toBe(code);
+    },
+  );
+
+  it("gives ENOSPC a capacity-specific remedy", () => {
+    const boom = Object.assign(new Error("no space left on device"), { code: "ENOSPC" });
     let caught: unknown;
     try {
       guardStateDir("/repo/.bulkhead", () => {
@@ -94,12 +110,14 @@ describe("state-dir error classification (F2 internals)", () => {
     } catch (e) {
       caught = e;
     }
-    expect(isStateDirError(caught)).toBe(true);
-    expect((caught as StateDirUnavailableError).fsCode).toBe(code);
+    expect(caught).toBeInstanceOf(StateDirUnavailableError);
+    expect((caught as StateDirUnavailableError).fsCode).toBe("ENOSPC");
+    expect((caught as Error).message).toContain("free blocks or inodes");
+    expect((caught as Error).message).not.toContain("chmod");
   });
 
-  it("keeps non-fail-closed errnos failing open — including ENOSPC, deliberately", () => {
-    for (const code of ["ENOSPC", "EIO", "EMFILE", "ENOENT"]) {
+  it("keeps errnos outside the named policy failing open", () => {
+    for (const code of ["EIO", "EMFILE", "ENOENT"]) {
       const boom = Object.assign(new Error(`boom ${code}`), { code });
       let caught: unknown;
       try {
@@ -113,7 +131,7 @@ describe("state-dir error classification (F2 internals)", () => {
     }
   });
 
-  it("passes non-permission errors through untouched (they keep failing open)", () => {
+  it("passes errors outside the named policy through untouched", () => {
     const boom = Object.assign(new Error("no such file"), { code: "ENOENT" });
     let caught: unknown;
     try {
