@@ -1,7 +1,12 @@
 import { describe, it, expect } from "vitest";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { withFileLock, atomicWrite, uniqueTmpPath } from "../src/fs-lock.js";
+import {
+  FileLockTimeoutError,
+  withFileLock,
+  atomicWrite,
+  uniqueTmpPath,
+} from "../src/fs-lock.js";
 import { tempRepo } from "./helpers.js";
 
 describe("fs-lock", () => {
@@ -14,6 +19,27 @@ describe("fs-lock", () => {
     });
     expect(result).toBe(42);
     expect(existsSync(lock)).toBe(false); // released after
+  });
+
+  it("times out without ever running the protected operation unlocked", () => {
+    const repo = tempRepo();
+    const lock = join(repo, "x.lock");
+    writeFileSync(lock, "held by another hook");
+    let entered = false;
+
+    expect(() =>
+      withFileLock(
+        lock,
+        () => {
+          entered = true;
+          return 42;
+        },
+        { timeoutMs: 25, staleMs: 60_000 },
+      ),
+    ).toThrow(FileLockTimeoutError);
+
+    expect(entered).toBe(false);
+    expect(existsSync(lock)).toBe(true); // never delete another process's lock
   });
 
   it("uniqueTmpPath returns distinct paths per call", () => {
