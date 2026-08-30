@@ -10,16 +10,40 @@ import {
 import { dirname } from "node:path";
 
 /**
+ * Raised when a cross-process state lock remains held past the bounded wait.
+ *
+ * This carries an errno-like code so guardStateDir can convert it into the same
+ * explicit fail-closed decision as other state-substrate availability failures.
+ */
+export class FileLockTimeoutError extends Error {
+  readonly code = "ELOCKTIMEOUT";
+  readonly lockPath: string;
+  readonly timeoutMs: number;
+
+  constructor(lockPath: string, timeoutMs: number) {
+    super(
+      `Timed out after ${timeoutMs}ms waiting for Bulkhead state lock \`${lockPath}\`. ` +
+        "The protected update was not executed without the lock.",
+    );
+    this.name = "FileLockTimeoutError";
+    this.lockPath = lockPath;
+    this.timeoutMs = timeoutMs;
+  }
+}
+
+/**
  * Cross-process critical section for the hot path.
  *
  * Claude Code runs tool calls in parallel, and each fires a PreToolUse hook as a
  * separate Node process. Several of those processes touch the same files (the
  * ledger, the daily-spend rollup), so an unlocked read-modify-write races: two
- * processes read the same tail and both append, forking the hash chain. This
- * takes a best-effort exclusive lock via an `wx` (O_EXCL) lockfile with bounded
- * spin-wait and stale-lock recovery. It never deadlocks the hook: if the lock
- * can't be acquired within the timeout it proceeds anyway (a rare, logged
- * degradation is better than freezing the user's agent).
+ * processes read the same tail and both append, forking the hash chain.
+ *
+ * The lock uses an `wx` (O_EXCL) lockfile with bounded spin-wait and stale-lock
+ * recovery. If the lock cannot be acquired before the timeout, the operation is
+ * NOT executed: a missing state update is recoverable and visible, while an
+ * unlocked hash-chain append permanently poisons ledger integrity. PreToolUse
+ * and Stop callers wrap this through guardStateDir and therefore fail closed.
  */
 export function withFileLock<T>(
   lockPath: string,
@@ -47,8 +71,7 @@ export function withFileLock<T>(
         }
       } catch { /* lock vanished; retry */ }
       if (Date.now() - start > timeoutMs) {
-        // Give up on the lock rather than block the agent. Proceed unlocked.
-        return fn();
+        throw new FileLockTimeoutError(lockPath, timeoutMs);
       }
       sleepSync(15);
     }
