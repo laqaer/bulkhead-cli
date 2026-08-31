@@ -13,6 +13,47 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  workflow-security:
+    name: Workflow action references are immutable
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - name: Reject mutable third-party action references
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mapfile -t action_lines < <(
+            grep -RInE '^[[:space:]]*-[[:space:]]*uses:[[:space:]]*[^[:space:]#]+' .github/workflows || true
+          )
+
+          bad=()
+          for line in "${action_lines[@]}"; do
+            spec="${line#*uses:}"
+            spec="${spec%%#*}"
+            spec="$(xargs <<< "${spec}")"
+
+            case "${spec}" in
+              ./*|docker://*)
+                continue
+                ;;
+            esac
+
+            ref="${spec##*@}"
+            if [[ ! "${ref}" =~ ^[0-9a-fA-F]{40}$ ]]; then
+              bad+=("${line}")
+            fi
+          done
+
+          if [ "${#bad[@]}" -ne 0 ]; then
+            echo "::error::Every remote GitHub Action must be pinned to a full 40-character commit SHA."
+            printf '%s\n' "${bad[@]}"
+            exit 1
+          fi
+
   verify:
     name: Verify Node ${{ matrix.node }}
     runs-on: ubuntu-latest
@@ -59,7 +100,9 @@ jobs:
           tarball="$(npm pack --silent)"
           test -f "$tarball"
           work="$(mktemp -d)"
+          trap 'rm -rf "$work"' EXIT
           cd "$work"
           npm init -y >/dev/null
           npm install --no-audit --no-fund "$GITHUB_WORKSPACE/$tarball"
-          npx --no-install bulkhead --help >/dev/null
+          test -x node_modules/.bin/bulkhead
+          node_modules/.bin/bulkhead --help >/dev/null
