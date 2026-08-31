@@ -1,23 +1,22 @@
-# Publishes @bulkheadtools/cli to npm with SLSA build provenance.
+# Publishes @bulkheadtools/cli to npm through trusted publishing (OIDC).
 #
-# RT-003b (red team audit 2026-08-22): published releases shipped from local
-# machines with no provenance attestations. This workflow makes GitHub Actions
-# the only publish path and attaches npm provenance to every release.
+# Security model:
+# - package construction, tests, audit, packing, and clean-install smoke run in
+#   an unprivileged job with no OIDC credential;
+# - the exact tarball that passed the smoke is checksummed and transferred as
+#   an immutable workflow artifact;
+# - the release-only job has OIDC permission but never checks out or executes
+#   repository code, and publishes only that verified tarball;
+# - every third-party action is pinned to an immutable commit SHA.
 #
-# Authentication uses npm trusted publishing (OIDC) — NO secrets are stored in
-# this repository. One-time founder setup on npmjs.com is required first:
-# configure @bulkheadtools/cli's trusted publisher as owner `laqaer`,
-# repository `bulkhead-cli`, workflow file `publish.yml`. Until that is done,
-# publishes will fail with 4xx from the registry rather than fall back to a
-# long-lived token.
+# npm one-time configuration must authorize owner `laqaer`, repository
+# `bulkhead-cli`, workflow `publish.yml`, environment `npm-publish`, and the
+# `npm publish` action. After OIDC is proven, require 2FA and disallow legacy
+# publish tokens in the npm package settings.
 #
-# Manual runs (workflow_dispatch) are a dry-run: they install, build, and smoke
-# the exact package tarball but never publish. Publishing happens only when a
-# GitHub Release is published, and only when the release tag matches
-# package.json's version. The clean-install smoke runs inside this job, so a
-# release cannot bypass the package-level gate.
-# Note: prepublishOnly (`npm run build && vitest run`) still executes during
-# `npm publish`, so tests gate every publish as well.
+# workflow_dispatch and pull_request runs verify and archive the package but
+# never publish. A published GitHub Release additionally requires the tag
+# version to match package.json and the tagged commit to be in main's history.
 
 name: Publish
 
@@ -25,67 +24,259 @@ on:
   release:
     types: [published]
   workflow_dispatch:
+  pull_request:
+    paths:
+      - .github/workflows/publish.yml
 
 permissions:
   contents: read
-  id-token: write # REQUIRED for OIDC trusted publishing / --provenance
 
 concurrency:
-  group: publish-${{ github.ref }}
+  group: publish-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: false
 
+env:
+  NODE_VERSION: 24.20.0
+  NPM_VERSION: 11.19.0
+  PACKAGE_NAME: "@bulkheadtools/cli"
+  PACKAGE_REPOSITORY: git+https://github.com/laqaer/bulkhead-cli.git
+
 jobs:
-  publish:
-    name: Build, verify, and publish with provenance
+  verify-package:
+    name: Build, verify, and smoke exact package artifact
     runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
     steps:
-      - name: Checkout repository
+      - name: Checkout exact event commit
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
           persist-credentials: false
 
-      - name: Setup Node
+      - name: Assert build job has no OIDC credential
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -n "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ] || [ -n "${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}" ]; then
+            echo "::error::The package-construction job unexpectedly has an OIDC credential."
+            exit 1
+          fi
+
+      - name: Setup pinned release runtime
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
-          node-version: 20 # engines: node >=20; no .nvmrc in repo
-          registry-url: https://registry.npmjs.org
+          node-version: ${{ env.NODE_VERSION }}
 
-      # Trusted publishing (tokenless OIDC auth) needs npm >= 11.5.0;
-      # Node 20 ships an older npm, so upgrade before publishing.
-      - name: Upgrade npm for trusted publishing support
-        run: npm install -g npm@latest
+      - name: Verify pinned release toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(node --version)" = "v${NODE_VERSION}"
+          test "$(npm --version)" = "${NPM_VERSION}"
 
-      - name: Install dependencies
-        run: npm ci
+      - name: Install locked dependencies
+        run: npm ci --no-audit --no-fund
 
       - name: Audit production dependency tree
         run: npm audit --omit=dev --audit-level=high
 
-      - name: Build
-        run: npm run build
+      - name: Typecheck
+        run: npm run typecheck
 
-      - name: Verify release tag matches package.json version
+      - name: Test source and built CLI
+        run: npm test
+
+      - name: Verify release source and version
         if: github.event_name == 'release'
+        shell: bash
         run: |
+          set -euo pipefail
+
           pkg_version="$(node -p "require('./package.json').version")"
           tag_version="${GITHUB_REF_NAME#v}"
           echo "release tag ${GITHUB_REF_NAME} -> ${tag_version}; package.json -> ${pkg_version}"
+
           if [ "${tag_version}" != "${pkg_version}" ]; then
-            echo "::error::Release tag '${GITHUB_REF_NAME}' does not match package.json version '${pkg_version}' - refusing to publish."
+            echo "::error::Release tag '${GITHUB_REF_NAME}' does not match package.json version '${pkg_version}'."
             exit 1
           fi
 
-      - name: Pack and install exactly what npm would receive
+          git fetch --no-tags origin main:refs/remotes/origin/main
+          if ! git merge-base --is-ancestor "${GITHUB_SHA}" refs/remotes/origin/main; then
+            echo "::error::Release commit ${GITHUB_SHA} is not in main's history."
+            exit 1
+          fi
+
+      - name: Pack and checksum exact publication artifact
+        id: pack
+        shell: bash
         run: |
           set -euo pipefail
-          tarball="$(npm pack --silent)"
-          test -f "$tarball"
-          work="$(mktemp -d)"
-          cd "$work"
-          npm init -y >/dev/null
-          npm install --no-audit --no-fund "$GITHUB_WORKSPACE/$tarball"
-          npx --no-install bulkhead --help >/dev/null
 
-      - name: Publish to npm with provenance
-        if: github.event_name == 'release'
-        run: npm publish --provenance
+          package_dir="${RUNNER_TEMP}/npm-package"
+          rm -rf "${package_dir}"
+          mkdir -p "${package_dir}"
+
+          mapfile -t pack_output < <(npm pack --silent --pack-destination "${package_dir}")
+          if [ "${#pack_output[@]}" -ne 1 ]; then
+            printf '::error::Expected one tarball from npm pack; got %s output line(s).\n' "${#pack_output[@]}"
+            printf '%s\n' "${pack_output[@]}"
+            exit 1
+          fi
+
+          tarball="${pack_output[0]}"
+          if [[ ! "${tarball}" =~ ^[A-Za-z0-9._+-]+\.tgz$ ]]; then
+            echo "::error::Unexpected npm pack filename '${tarball}'."
+            exit 1
+          fi
+          test -f "${package_dir}/${tarball}"
+
+          cd "${package_dir}"
+          digest="$(sha256sum "${tarball}" | awk '{print $1}')"
+          printf '%s  %s\n' "${digest}" "${tarball}" > "${tarball}.sha256"
+          printf '%s\n' "${tarball}" > TARBALL
+          printf '%s\n' "${GITHUB_SHA}" > SOURCE_SHA
+          printf '%s\n' "${GITHUB_REF}" > SOURCE_REF
+          printf 'node=%s\nnpm=%s\nsha256=%s\n' \
+            "$(node --version)" "$(npm --version)" "${digest}" > BUILD_METADATA
+          sha256sum --check "${tarball}.sha256"
+
+          echo "tarball=${tarball}" >> "${GITHUB_OUTPUT}"
+          echo "sha256=${digest}" >> "${GITHUB_OUTPUT}"
+
+      - name: Clean-install and smoke exact tarball
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          package_dir="${RUNNER_TEMP}/npm-package"
+          tarball="$(cat "${package_dir}/TARBALL")"
+          work="$(mktemp -d)"
+          trap 'rm -rf "${work}"' EXIT
+
+          cd "${work}"
+          npm init -y >/dev/null
+          npm install --no-audit --no-fund "${package_dir}/${tarball}"
+          test -x node_modules/.bin/bulkhead
+          node_modules/.bin/bulkhead --help >/dev/null
+
+          cd "${package_dir}"
+          sha256sum --check "${tarball}.sha256"
+
+      - name: Dry-run publish exact tarball
+        shell: bash
+        run: |
+          set -euo pipefail
+          package_dir="${RUNNER_TEMP}/npm-package"
+          tarball="$(cat "${package_dir}/TARBALL")"
+          npm publish "${package_dir}/${tarball}" --dry-run --access public --ignore-scripts
+
+      - name: Upload verified package artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: npm-package-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/npm-package/
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30
+
+  publish:
+    name: Publish exact verified tarball with provenance
+    if: github.event_name == 'release'
+    needs: verify-package
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment: npm-publish
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Download verified package artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: npm-package-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/npm-package/
+
+      - name: Setup pinned publishing runtime
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          registry-url: https://registry.npmjs.org
+
+      - name: Verify credential boundary and exact artifact
+        id: artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          test "$(node --version)" = "v${NODE_VERSION}"
+          test "$(npm --version)" = "${NPM_VERSION}"
+          test -n "${ACTIONS_ID_TOKEN_REQUEST_URL:-}"
+          test -n "${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}"
+
+          package_dir="${RUNNER_TEMP}/npm-package"
+          cd "${package_dir}"
+
+          mapfile -t tarballs < <(find . -maxdepth 1 -type f -name '*.tgz' -printf '%f\n' | sort)
+          if [ "${#tarballs[@]}" -ne 1 ]; then
+            printf '::error::Expected exactly one tarball; found %s.\n' "${#tarballs[@]}"
+            exit 1
+          fi
+
+          tarball="${tarballs[0]}"
+          test "$(cat TARBALL)" = "${tarball}"
+          test "$(cat SOURCE_SHA)" = "${GITHUB_SHA}"
+          test "$(cat SOURCE_REF)" = "${GITHUB_REF}"
+          test -f "${tarball}.sha256"
+
+          mapfile -t checksum_lines < "${tarball}.sha256"
+          if [ "${#checksum_lines[@]}" -ne 1 ]; then
+            echo "::error::Expected exactly one checksum record."
+            exit 1
+          fi
+
+          expected_digest="${checksum_lines[0]%% *}"
+          if [[ ! "${expected_digest}" =~ ^[0-9a-f]{64}$ ]]; then
+            echo "::error::Invalid SHA-256 digest in artifact manifest."
+            exit 1
+          fi
+          test "${checksum_lines[0]}" = "${expected_digest}  ${tarball}"
+
+          actual_digest="$(sha256sum "${tarball}" | awk '{print $1}')"
+          test "${actual_digest}" = "${expected_digest}"
+          grep -Fx "node=v${NODE_VERSION}" BUILD_METADATA
+          grep -Fx "npm=${NPM_VERSION}" BUILD_METADATA
+          grep -Fx "sha256=${actual_digest}" BUILD_METADATA
+
+          mapfile -t package_metadata < <(
+            tar -xOf "${tarball}" package/package.json |
+              node -e '
+                let input = "";
+                process.stdin.setEncoding("utf8");
+                process.stdin.on("data", chunk => { input += chunk; });
+                process.stdin.on("end", () => {
+                  const pkg = JSON.parse(input);
+                  console.log(pkg.name ?? "");
+                  console.log(pkg.version ?? "");
+                  console.log(pkg.repository?.url ?? "");
+                });
+              '
+          )
+
+          if [ "${#package_metadata[@]}" -ne 3 ]; then
+            echo "::error::Could not read complete package metadata from ${tarball}."
+            exit 1
+          fi
+
+          tag_version="${GITHUB_REF_NAME#v}"
+          test "${package_metadata[0]}" = "${PACKAGE_NAME}"
+          test "${package_metadata[1]}" = "${tag_version}"
+          test "${package_metadata[2]}" = "${PACKAGE_REPOSITORY}"
+
+          echo "tarball=${package_dir}/${tarball}" >> "${GITHUB_OUTPUT}"
+
+      - name: Publish exact smoked tarball
+        run: npm publish "${{ steps.artifact.outputs.tarball }}" --access public --provenance --ignore-scripts
