@@ -26,8 +26,11 @@ jobs:
         run: |
           set -euo pipefail
 
+          # Match both step-level actions (`- uses:`) and job-level reusable
+          # workflows (`uses:`). Local actions and Docker references are not
+          # GitHub repository refs and are outside this SHA-pinning rule.
           mapfile -t action_lines < <(
-            grep -RInE '^[[:space:]]*-[[:space:]]*uses:[[:space:]]*[^[:space:]#]+' .github/workflows || true
+            grep -RInE '^[[:space:]]*(-[[:space:]]*)?uses:[[:space:]]*[^[:space:]#]+' .github/workflows || true
           )
 
           bad=()
@@ -49,7 +52,7 @@ jobs:
           done
 
           if [ "${#bad[@]}" -ne 0 ]; then
-            echo "::error::Every remote GitHub Action must be pinned to a full 40-character commit SHA."
+            echo "::error::Every remote GitHub Action and reusable workflow must be pinned to a full 40-character commit SHA."
             printf '%s\n' "${bad[@]}"
             exit 1
           fi
