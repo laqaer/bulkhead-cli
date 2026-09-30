@@ -7,9 +7,11 @@ import {
   type Policy,
 } from "../policy.js";
 import { isFileWriteTool, isBashTool, targetPaths, rmTargets } from "../extract.js";
+import { HARD_LINK_SCAN_LIMIT, scanHardLinks } from "./hard-links.js";
 
 const GUARD = "protected-paths";
 const WORKSPACE_BOUNDARY_RULE = "structured-write-outside-workspace";
+const HARD_LINK_UNVERIFIED_RULE = "hard-link-alias-unverified";
 
 /**
  * Resolve `target` to its real location WITHOUT requiring the leaf to exist.
@@ -88,6 +90,12 @@ function workspaceBoundaryVerdict(
  * Matching runs on BOTH the lexical path and its realpath-resolved form, so a
  * symlinked ancestor created with an allowed Bash command (`ln -s prod gate`,
  * then Write `gate/evil.txt`) cannot walk through a protected path.
+ *
+ * A hard link has no path relationship to resolve, so structured writes also
+ * compare file identity: when the target already exists with more than one
+ * link, any other name for the same inode that is protected denies the write
+ * (see scanHardLinks). The workspace boundary stays path-based — a hard link
+ * to a host file outside the workspace is only caught by an absolute deny glob.
  */
 export function protectedPathsGuard(call: ToolCall, policy: Policy): GuardVerdict {
   const root = resolve(policy.workspaceRoot);
@@ -120,8 +128,9 @@ export function protectedPathsGuard(call: ToolCall, policy: Policy): GuardVerdic
       ? picomatch(policy.protectedPaths.allow, { dot: true })
       : () => false;
 
-  const check = (absPath: string): GuardVerdict | null => {
-    const real = resolveRealCandidate(absPath);
+  // Path-only verdict: lexical + canonical candidates, no identity check. It
+  // classifies the target itself and every hard-link alias the scan finds.
+  const pathVerdict = (absPath: string, real: string): GuardVerdict | null => {
     const rel = relative(root, absPath);
     // Raw pair keeps the historical shape: outside-root paths matched the
     // absolute form only (their relative form is meaningless `../..` noise).
@@ -162,9 +171,53 @@ export function protectedPathsGuard(call: ToolCall, policy: Policy): GuardVerdic
     return null;
   };
 
+  const display = (absPath: string): string => {
+    const rel = relative(root, absPath);
+    return rel && !rel.startsWith("..") && !isAbsolute(rel) ? rel : absPath;
+  };
+
+  // Identity check (issue #3): a hard link is a second name for the SAME
+  // inode, invisible to path matching, so writing an unprotected alias writes
+  // the protected file. Runs for writes only — unlinking an alias (`rm`)
+  // leaves the protected name and its contents untouched.
+  const hardLinkVerdict = (absPath: string, real: string): GuardVerdict | null => {
+    const scan = scanHardLinks(real, {
+      root,
+      rootReal,
+      patterns: [...IMMUTABLE_PROTECTED_PATHS, ...deny],
+      classify: (alias) => pathVerdict(alias, resolveRealCandidate(alias)),
+      limit: HARD_LINK_SCAN_LIMIT,
+    });
+    if (scan.kind === "clear") return null;
+    if (scan.kind === "alias") {
+      return {
+        action: "deny",
+        guard: GUARD,
+        rule: scan.verdict.rule,
+        reason: `\`${display(absPath)}\` is a hard link to \`${display(scan.path)}\` — the same file, so writing one writes both. ${scan.verdict.reason}`,
+      };
+    }
+    // Could not enumerate every protected name: fail closed. Only reachable
+    // for targets with more than one link.
+    return {
+      action: "deny",
+      guard: GUARD,
+      rule: HARD_LINK_UNVERIFIED_RULE,
+      reason: `\`${display(absPath)}\` has ${scan.links} hard links and Bulkhead could not rule out that one of them is a protected path: ${scan.detail}.`,
+    };
+  };
+
+  /** The one chokepoint every structured write and Bash `rm` target passes. */
+  const check = (absPath: string, access: "write" | "delete"): GuardVerdict | null => {
+    const real = resolveRealCandidate(absPath);
+    const verdict = pathVerdict(absPath, real);
+    if (verdict || access === "delete") return verdict;
+    return hardLinkVerdict(absPath, real);
+  };
+
   if (isFileWriteTool(call.toolName)) {
     for (const path of targetPaths(call, root)) {
-      const verdict = check(path);
+      const verdict = check(path, "write");
       if (verdict) return verdict;
     }
   }
@@ -176,7 +229,7 @@ export function protectedPathsGuard(call: ToolCall, policy: Policy): GuardVerdic
       if (targets) {
         for (const target of targets) {
           const abs = resolve(root, target);
-          const verdict = check(abs);
+          const verdict = check(abs, "delete");
           if (verdict) {
             return {
               ...verdict,

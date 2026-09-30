@@ -5,6 +5,22 @@ contents are recoverable from the git history, not summarised here.
 
 ## Unreleased
 
+### Fixed
+
+- **Hard links bypassed protected-path matching**
+  ([#3](https://github.com/laqaer/bulkhead-cli/issues/3)). A hard link is a
+  second directory entry for the same inode, so `ln .env hardcopy.conf` then
+  writing `hardcopy.conf` wrote `.env` while the guard reported `allow` — and
+  the same trick against `bulkhead.yaml` or `.bulkhead/ledger.jsonl` let an
+  agent rewrite its own policy or truncate the ledger tail. When a write target
+  has more than one link, the guard now enumerates every existing file a deny
+  or immutable glob can match and compares device + inode. A protected alias
+  denies with the alias's rule; a scan that cannot finish (unreadable protected
+  directory, or more than 20,000 entries under unanchored globs) fails closed.
+  Single-link files — nearly all of them — cost one extra `stat`. Nothing is
+  cached, so a link created after the policy loaded is still caught. `rm` of an
+  alias stays allowed: unlinking one name leaves the protected file intact.
+
 ### Changed
 
 - **`ENOSPC` now fails closed for Bulkhead state writes.** Capacity exhaustion
@@ -16,6 +32,13 @@ contents are recoverable from the git history, not summarised here.
 
 ### Tests
 
+- The `hard links are NOT covered` pins are inverted: Write, Edit, MultiEdit
+  and NotebookEdit through a hard link to a protected file now deny, including
+  through a chain of links, links created after the policy loaded, and aliases
+  of `bulkhead.yaml` and the ledger. Controls pin that unprotected multi-link
+  files, allow-exempted protected names, and `rm` of an alias stay allowed.
+- A hard link to a host file outside the workspace is pinned as a known
+  limitation, alongside the absolute deny glob that closes it for named paths.
 - The named fail-closed errno table now pins `ENOSPC`, with `EIO`, `EMFILE`, and
   `ENOENT` retained as explicit fail-open controls and a focused assertion for
   the capacity-specific remediation.
