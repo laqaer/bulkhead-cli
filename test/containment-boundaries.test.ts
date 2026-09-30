@@ -1,5 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
+  linkSync,
+  mkdirSync,
   mkdtempSync,
   rmSync,
   symlinkSync,
@@ -125,6 +127,30 @@ describe("policy self-protection", () => {
       rmSync(repo, { recursive: true, force: true });
     }
   });
+
+  it("denies an allowed hard-link alias of the policy file or the evidence ledger", () => {
+    // Writing a hard link to bulkhead.yaml rewrites the policy; one to the
+    // ledger can truncate its tail, which the hash chain cannot detect.
+    const repo = tempRepo();
+    try {
+      mkdirSync(join(repo, ".bulkhead"));
+      writeFileSync(join(repo, "bulkhead.yaml"), "version: 1\n");
+      writeFileSync(join(repo, ".bulkhead", "ledger.jsonl"), "{}\n");
+      linkSync(join(repo, "bulkhead.yaml"), join(repo, "policy-copy.yaml"));
+      linkSync(join(repo, ".bulkhead", "ledger.jsonl"), join(repo, "ledger-copy.jsonl"));
+      const policy = defaultPolicy(repo);
+      policy.protectedPaths.allow = ["policy-copy.yaml", "ledger-copy.jsonl"];
+
+      const toPolicy = protectedPathsGuard(write(join(repo, "policy-copy.yaml")), policy);
+      expect(toPolicy.action).toBe("deny");
+      expect(toPolicy.rule).toBe("bulkhead.yaml");
+      const toLedger = protectedPathsGuard(write(join(repo, "ledger-copy.jsonl")), policy);
+      expect(toLedger.action).toBe("deny");
+      expect(toLedger.rule).toBe(".bulkhead/**");
+    } finally {
+      rmSync(repo, { recursive: true, force: true });
+    }
+  });
 });
 
 describe("structured file-tool workspace containment", () => {
@@ -175,6 +201,32 @@ describe("structured file-tool workspace containment", () => {
       );
       expect(verdict.action).toBe("deny");
       expect(verdict.rule).toBe("structured-write-outside-workspace");
+    } finally {
+      rmSync(repo, { recursive: true, force: true });
+      rmSync(outside, { recursive: true, force: true });
+    }
+  });
+
+  // KNOWN LIMITATION, pinned deliberately: the boundary is path-based, and a
+  // hard link has no path relationship to its other names. Proving a file has
+  // no name outside the workspace would mean scanning the whole filesystem,
+  // so a same-filesystem `ln ~/.zshrc z` then Write `z` reaches the host file.
+  // Identity matching covers protected globs, including absolute ones — which
+  // is how a user protects specific host files. See README "What it does and
+  // doesn't stop". If a boundary identity check lands, flip the first assert.
+  it("catches a hard link to a host file only when an absolute deny glob names it", () => {
+    const repo = tempRepo();
+    const outside = mkdtempSync(join(tmpdir(), "bulkhead-outside-"));
+    try {
+      writeFileSync(join(outside, "id_key"), "secret");
+      linkSync(join(outside, "id_key"), join(repo, "key-copy"));
+      const policy = defaultPolicy(repo);
+      expect(protectedPathsGuard(write(join(repo, "key-copy")), policy).action).toBe("allow");
+
+      policy.protectedPaths.deny = [...policy.protectedPaths.deny, `${outside}/**`];
+      const verdict = protectedPathsGuard(write(join(repo, "key-copy")), policy);
+      expect(verdict.action).toBe("deny");
+      expect(verdict.rule).toBe(`${outside}/**`);
     } finally {
       rmSync(repo, { recursive: true, force: true });
       rmSync(outside, { recursive: true, force: true });

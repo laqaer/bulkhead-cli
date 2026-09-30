@@ -202,7 +202,12 @@ the left column.
 **It does:**
 
 - Deny writes/deletes to protected paths for the structured file tools
-  (Write/Edit/MultiEdit/NotebookEdit), where the path is a field it can read.
+  (Write/Edit/MultiEdit/NotebookEdit), where the path is a field it can read —
+  including a write that reaches a protected file through a symlink
+  (`ln -s prod gate`) or a hard link (`ln .env hardcopy.conf`). A hard link has
+  no path to resolve, so when a write target has more than one link Bulkhead
+  compares file identity (device + inode) against every existing protected
+  file, and denies if it cannot finish that check.
 - Deny Bash commands matching your blocked patterns, and any `rm` resolving
   outside the workspace.
 - Pause the agent at a hard dollar cap (deterministic transcript sum).
@@ -227,15 +232,17 @@ the left column.
 - **Guarantee it runs.** Hooks fire because the host runs them. `claude --bare`
   skips hooks; anyone can uninstall them; a future Claude Code version could
   change the contract. Bulkhead targets **Claude Code 2.1.86**'s hook API.
-- **Stop a hard link.** Protected-path matching resolves symlinks (a write
-  through `ln -s prod gate` is denied), but a hard link is a second directory
-  entry for the same inode — there is nothing for `realpath` to resolve, so
-  `ln .env hardcopy.conf` then writing `hardcopy.conf` is **allowed**. The
-  exposure is bounded: the OS refuses to hard-link a directory, so no new file
-  can appear inside a protected directory this way — only an already-existing
-  protected file can be modified. The write is still recorded in the ledger.
-  Tracked as https://github.com/laqaer/bulkhead-cli/issues/3 — pinned by
-  test so a fix cannot land silently.
+- **Close the check-to-write window.** Guards run when the hook fires, just
+  before the tool opens the file. A process the agent left running in the
+  background can create a symlink or hard link in that window, and no check can
+  see a link that does not exist yet. The write is still recorded in the ledger.
+- **Catch a hard link to a file outside the workspace.** Structured writes to
+  paths outside the workspace are denied, but a same-filesystem
+  `ln ~/.zshrc z` followed by a write to `z` reaches the host file through a
+  workspace path: proving a file has no name outside the workspace would mean
+  scanning the whole filesystem. Identity matching covers your deny globs,
+  absolute ones included, so a deny rule naming a host path (e.g.
+  `/Users/you/.ssh/**`) also covers hard links to it.
 
 **Design choices that follow from this:**
 

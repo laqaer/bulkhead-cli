@@ -1,8 +1,17 @@
 import { describe, it, expect } from "vitest";
-import { linkSync, mkdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  linkSync,
+  mkdirSync,
+  realpathSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { join } from "node:path";
 import { defaultPolicy } from "../src/policy.js";
 import { protectedPathsGuard } from "../src/guards/protected-paths.js";
+import { scanHardLinks } from "../src/guards/hard-links.js";
 import { blockedCommandsGuard } from "../src/guards/blocked-commands.js";
 import { budgetGuard } from "../src/guards/budget.js";
 import { loopCheck, emptyLoopState, signatureFor } from "../src/guards/loop.js";
@@ -17,6 +26,18 @@ function write(path: string): ToolCall {
 }
 function bash(command: string): ToolCall {
   return { toolName: "Bash", toolInput: { command } };
+}
+function edit(path: string): ToolCall {
+  return { toolName: "Edit", toolInput: { file_path: path, old_string: "a", new_string: "b" } };
+}
+function multiEdit(path: string): ToolCall {
+  return {
+    toolName: "MultiEdit",
+    toolInput: { edits: [{ file_path: path, old_string: "a", new_string: "b" }] },
+  };
+}
+function notebook(path: string): ToolCall {
+  return { toolName: "NotebookEdit", toolInput: { notebook_path: path, content: "{}" } };
 }
 
 describe("protected-paths guard", () => {
@@ -119,19 +140,6 @@ describe("protected-paths: symlink resolution (F1)", () => {
     symlinkSync(join(repo, ".env"), join(repo, "settings.conf"));
     symlinkSync(join(repo, "realsrc"), join(repo, "srclink"));
     return { repo, cleanup: () => rmSync(repo, { recursive: true, force: true }) };
-  }
-
-  function edit(path: string): ToolCall {
-    return { toolName: "Edit", toolInput: { file_path: path, old_string: "a", new_string: "b" } };
-  }
-  function multiEdit(path: string): ToolCall {
-    return {
-      toolName: "MultiEdit",
-      toolInput: { edits: [{ file_path: path, old_string: "a", new_string: "b" }] },
-    };
-  }
-  function notebook(path: string): ToolCall {
-    return { toolName: "NotebookEdit", toolInput: { notebook_path: path, content: "{}" } };
   }
 
   it("denies Write through a dir symlink into a protected dir", () => {
@@ -434,23 +442,19 @@ describe("loop guard", () => {
   });
 });
 
-// KNOWN LIMITATION, pinned deliberately: hard links.
-//
-// The F1 fix resolves symlinks because `realpath` can see them. A hard link is
-// a second directory entry for the SAME inode, so there is no link to resolve
-// and no path relationship to discover — `realpath` on the alias returns the
-// alias. Matching on paths therefore cannot see it.
-//
-// These tests assert the CURRENT (permissive) verdicts on purpose. They are a
-// tripwire, not an endorsement: if someone lands inode comparison, these go red
-// and must be flipped to `deny` in the same change. The exposure is bounded —
-// `ln` cannot create a hard link to a directory (the OS refuses), so no NEW
-// file can appear inside a protected dir this way; only modification of an
-// already-existing protected file is reachable. The allowed write is still
-// recorded in the ledger, so the evidence half keeps working. See README
-// "What it does and doesn't stop" and
-// https://github.com/laqaer/bulkhead-cli/issues/3.
-describe("protected-paths: hard links are NOT covered (documented limitation)", () => {
+// Issue #3: hard links. A hard link is a second directory entry for the SAME
+// inode, so there is no link for `realpath` to resolve and no path
+// relationship to match: `ln .env hardcopy.conf` then Write `hardcopy.conf`
+// wrote .env while the guard said allow. The guard now compares file identity
+// (dev+ino) against every existing protected name whenever a write target has
+// more than one link. `ln` still cannot hard-link a directory, so identity
+// only ever matters for files that already exist.
+describe("protected-paths: hard links (issue #3)", () => {
+  // Layout per test:
+  //   repo/.env, repo/prod/config.txt           (protected originals)
+  //   repo/hardcopy.conf  == .env                (hard link)
+  //   repo/sneaky.txt     == prod/config.txt     (hard link)
+  //   repo/sneakier.txt   == sneaky.txt          (link of a link: same inode)
   function setup(): { repo: string; cleanup: () => void } {
     const repo = tempRepo();
     mkdirSync(join(repo, "prod"));
@@ -458,24 +462,123 @@ describe("protected-paths: hard links are NOT covered (documented limitation)", 
     writeFileSync(join(repo, "prod", "config.txt"), "k=v");
     linkSync(join(repo, ".env"), join(repo, "hardcopy.conf"));
     linkSync(join(repo, "prod", "config.txt"), join(repo, "sneaky.txt"));
+    linkSync(join(repo, "sneaky.txt"), join(repo, "sneakier.txt"));
     return { repo, cleanup: () => rmSync(repo, { recursive: true, force: true }) };
   }
 
-  it("allows a Write through a hard link onto a protected file", () => {
+  it.each([
+    ["Write", write],
+    ["Edit", edit],
+    ["MultiEdit", multiEdit],
+    ["NotebookEdit", notebook],
+  ] as const)("denies %s through a hard link onto a protected file", (_name, tool) => {
     const { repo, cleanup } = setup();
     try {
-      const call = write(join(repo, "hardcopy.conf"));
+      const v = protectedPathsGuard(tool(join(repo, "hardcopy.conf")), defaultPolicy(repo));
+      expect(v.action).toBe("deny");
+      expect(v.rule).toBe(".env");
+      expect(v.reason).toContain("hard link to `.env`");
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("denies a write reaching a protected dir's file through a chain of links", () => {
+    const { repo, cleanup } = setup();
+    try {
+      const v = protectedPathsGuard(write(join(repo, "sneakier.txt")), defaultPolicy(repo));
+      expect(v.action).toBe("deny");
+      expect(v.rule).toBe("prod/**");
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("sees a link created after the policy was loaded (nothing is cached)", () => {
+    const { repo, cleanup } = setup();
+    try {
+      const policy = defaultPolicy(repo);
+      const notes = join(repo, "notes.txt");
+      writeFileSync(notes, "plain");
+      expect(protectedPathsGuard(write(notes), policy).action).toBe("allow");
+      rmSync(notes);
+      linkSync(join(repo, ".env"), notes);
+      expect(protectedPathsGuard(write(notes), policy).action).toBe("deny");
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("still allows writing a multiply-linked file none of whose names is protected", () => {
+    // The over-broad-fix tripwire: nlink > 1 alone is not a reason to deny.
+    const { repo, cleanup } = setup();
+    try {
+      mkdirSync(join(repo, "src"));
+      writeFileSync(join(repo, "src", "a.ts"), "export {};");
+      linkSync(join(repo, "src", "a.ts"), join(repo, "src", "b.ts"));
+      expect(protectedPathsGuard(write(join(repo, "src", "b.ts")), defaultPolicy(repo)).action).toBe(
+        "allow",
+      );
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("honours an allow exception on the protected name, and only that name", () => {
+    const { repo, cleanup } = setup();
+    try {
+      writeFileSync(join(repo, "prod", "README.md"), "docs");
+      linkSync(join(repo, "prod", "README.md"), join(repo, "readme-copy.md"));
+      const p = defaultPolicy(repo);
+      p.protectedPaths.allow = ["prod/README.md"];
+      expect(protectedPathsGuard(write(join(repo, "readme-copy.md")), p).action).toBe("allow");
+      expect(protectedPathsGuard(write(join(repo, "sneaky.txt")), p).action).toBe("deny");
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("allows rm of an alias: unlinking one name leaves the protected file intact", () => {
+    const { repo, cleanup } = setup();
+    try {
+      const call = bash(`rm ${join(repo, "hardcopy.conf")}`);
       expect(protectedPathsGuard(call, defaultPolicy(repo)).action).toBe("allow");
     } finally {
       cleanup();
     }
   });
 
-  it("allows a Write through a hard link to a file inside a protected dir", () => {
+  it.skipIf(process.getuid?.() === 0)(
+    "fails closed when a protected dir that could hold the alias is unreadable",
+    () => {
+      // `chmod 000 prod` must not turn the identity check back off.
+      const { repo, cleanup } = setup();
+      try {
+        chmodSync(join(repo, "prod"), 0o000);
+        const v = protectedPathsGuard(write(join(repo, "sneaky.txt")), defaultPolicy(repo));
+        expect(v.action).toBe("deny");
+        expect(v.rule).toBe("hard-link-alias-unverified");
+      } finally {
+        chmodSync(join(repo, "prod"), 0o755);
+        cleanup();
+      }
+    },
+  );
+
+  it("reports a scan that hits its entry limit as unverifiable, not clear", () => {
+    // Bounds hook latency. Exhausting the budget must fail closed, or padding
+    // a protected dir with junk entries would switch the check off.
     const { repo, cleanup } = setup();
     try {
-      const call = write(join(repo, "sneaky.txt"));
-      expect(protectedPathsGuard(call, defaultPolicy(repo)).action).toBe("allow");
+      const target = realpathSync(join(repo, "hardcopy.conf"));
+      const opts = {
+        root: repo,
+        rootReal: realpathSync(repo),
+        patterns: [".env"],
+        classify: () => ({ action: "deny" as const, guard: "protected-paths" }),
+      };
+      expect(scanHardLinks(target, { ...opts, limit: 0 }).kind).toBe("unverifiable");
+      expect(scanHardLinks(target, { ...opts, limit: 100 }).kind).toBe("alias");
     } finally {
       cleanup();
     }
