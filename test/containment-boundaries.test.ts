@@ -57,7 +57,15 @@ describe("policy self-protection", () => {
 
     expect(policy.workspaceRoot).toBe("/repo");
     expect(policy.protectedPaths.deny).toEqual(
-      expect.arrayContaining(["bulkhead.yaml", ".bulkhead", ".bulkhead/**", ".env"]),
+      expect.arrayContaining([
+        "bulkhead.yaml",
+        ".bulkhead",
+        ".bulkhead/**",
+        ".claude",
+        ".claude/settings.json",
+        ".claude/settings.local.json",
+        ".env",
+      ]),
     );
     expect(policy.blockedCommands.map((rule) => rule.pattern)).toEqual(
       expect.arrayContaining([
@@ -98,6 +106,43 @@ describe("policy self-protection", () => {
     expect(
       protectedPathsGuard(write("/repo/.bulkhead/ledger.jsonl"), policy).action,
     ).toBe("deny");
+  });
+
+  it("does not let policy YAML or allow rules exempt the settings files that load the hooks", () => {
+    const policy = normalizePolicy(
+      {
+        protected_paths: {
+          deny: [],
+          allow: [".claude/settings.json", ".claude/settings.local.json", ".claude/**"],
+        },
+      },
+      "/repo",
+    );
+
+    for (const call of [
+      write("/repo/.claude/settings.json"),
+      edit("/repo/.claude/settings.json"),
+      multiEdit("/repo/.claude/settings.local.json"),
+    ]) {
+      const verdict = protectedPathsGuard(call, policy);
+      expect(verdict.action).toBe("deny");
+      expect(verdict.reason).toContain("immutable");
+    }
+  });
+
+  it("denies a symlink alias onto .claude/settings.json even when the alias is allowed", () => {
+    const repo = tempRepo();
+    try {
+      mkdirSync(join(repo, ".claude"));
+      writeFileSync(join(repo, ".claude", "settings.json"), "{}\n");
+      symlinkSync(join(repo, ".claude", "settings.json"), join(repo, "hooks.json"));
+      const policy = defaultPolicy(repo);
+      policy.protectedPaths.allow = ["hooks.json"];
+
+      expect(protectedPathsGuard(write(join(repo, "hooks.json")), policy).action).toBe("deny");
+    } finally {
+      rmSync(repo, { recursive: true, force: true });
+    }
   });
 
   it("preserves exact allow exceptions for non-immutable project paths", () => {

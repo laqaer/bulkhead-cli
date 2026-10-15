@@ -1,5 +1,6 @@
 import type { LedgerEntry, RiskLevel } from "./types.js";
 import { rankOf } from "./risk.js";
+import { actionSummary } from "./describe.js";
 
 /**
  * The approval inbox's review surface: the risky actions an agent took (or was
@@ -18,8 +19,14 @@ export interface InboxItem {
   level: RiskLevel;
   score: number;
   reasons: string[];
-  /** What the enforcement engine did: allow (record mode) or ask. */
+  /** What the enforcement engine did: allow (record mode), ask, or deny. */
   action?: string;
+  /**
+   * True when Bulkhead denied the action: it was scored as risky AND refused,
+   * so it never ran. Rendered as "(blocked)" — a blocked force-push must never
+   * read like one that happened.
+   */
+  blocked: boolean;
 }
 
 export interface Inbox {
@@ -27,7 +34,11 @@ export interface Inbox {
   counts: Record<RiskLevel, number>;
 }
 
-export function buildInbox(entries: LedgerEntry[], minLevel: RiskLevel = "low"): Inbox {
+export function buildInbox(
+  entries: LedgerEntry[],
+  minLevel: RiskLevel = "low",
+  opts: { repoRoot?: string } = {},
+): Inbox {
   const items: InboxItem[] = [];
   for (const e of entries) {
     if (e.event !== "pre" || !e.risk?.level) continue;
@@ -37,11 +48,12 @@ export function buildInbox(entries: LedgerEntry[], minLevel: RiskLevel = "low"):
       ts: e.ts,
       sessionId: e.sessionId,
       toolName: e.toolName,
-      summary: summarize(e),
+      summary: summarize(e, opts.repoRoot),
       level: e.risk.level,
       score: e.risk.score,
       reasons: e.risk.signals.map((s) => s.reason),
       action: e.action,
+      blocked: e.action === "deny",
     });
   }
   // Highest level first, then highest score, then most recent.
@@ -56,20 +68,9 @@ export function buildInbox(entries: LedgerEntry[], minLevel: RiskLevel = "low"):
   return { items, counts };
 }
 
-function summarize(e: LedgerEntry): string {
-  const input = e.toolInput as Record<string, unknown> | undefined;
-  if (input) {
-    if (typeof input.command === "string") return truncate(input.command, 120);
-    const p = input.file_path ?? input.path ?? input.notebook_path;
-    if (typeof p === "string") return truncate(p, 120);
-    if (typeof input.url === "string") return truncate(input.url, 120);
-  }
-  return e.toolName ?? "(action)";
-}
-
-function truncate(s: string, max: number): string {
-  const clean = s.replace(/\s+/g, " ").trim();
-  return clean.length > max ? clean.slice(0, max) + "…" : clean;
+function summarize(e: LedgerEntry, repoRoot: string | undefined): string {
+  // Local review surface: the real command, paths shown repo-relative.
+  return actionSummary(e.toolInput, { repoRoot, mode: "paths", max: 120 }) || e.toolName || "(action)";
 }
 
 const ICON: Record<RiskLevel, string> = { high: "🔴", medium: "🟠", low: "🟡" };
@@ -82,7 +83,8 @@ export function renderInbox(inbox: Inbox): string {
     "",
   ];
   for (const it of inbox.items) {
-    lines.push(`${ICON[it.level]} [${it.level} ${it.score}] #${it.seq} ${it.toolName ?? ""}${it.action === "ask" ? " (asked)" : ""}`);
+    const mark = it.blocked ? " (blocked)" : it.action === "ask" ? " (asked)" : "";
+    lines.push(`${ICON[it.level]} [${it.level} ${it.score}] #${it.seq} ${it.toolName ?? ""}${mark}`);
     lines.push(`    ${it.summary}`);
     lines.push(`    ${it.reasons.join("; ")}`);
   }

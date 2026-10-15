@@ -55,6 +55,32 @@ describe("report content", () => {
     expect(text).toContain("contradicted");
   });
 
+  it("prints each denial with the rule's human message, not its regex", () => {
+    const repo = tempRepo();
+    appendLedger(repo, { ts: "t0", sessionId: "s", event: "pre", toolName: "Bash", action: "allow" });
+    appendLedger(repo, { ts: "t1", sessionId: "s", event: "pre", toolName: "Bash", action: "allow" });
+    appendLedger(repo, {
+      ts: "t2", sessionId: "s", event: "pre", toolName: "Bash", action: "deny",
+      toolInput: { command: 'psql -c "DROP TABLE users;"' },
+      guard: "blocked-commands", rule: "\\bDROP\\s+TABLE\\b",
+      reason: "SQL DROP TABLE — matched blocked command pattern.",
+    });
+    appendLedger(repo, {
+      ts: "t3", sessionId: "s", event: "pre", toolName: "Write", action: "deny",
+      toolInput: { file_path: `${repo}/.env` },
+      guard: "protected-paths", rule: ".env",
+      reason: "`.env` is a protected path (write/delete denied by bulkhead.yaml).",
+    });
+
+    const r = buildSessionReport(readLedger(repo), "s", { repoRoot: repo });
+    expect(r.denials.map((d) => d.label)).toEqual(["SQL DROP TABLE", "protected path (.env)"]);
+    expect(r.denials[1]!.summary).toBe(".env");
+    const text = renderSessionReport(r);
+    expect(text).toContain("⛔ #2 Bash · SQL DROP TABLE (blocked-commands)");
+    expect(text).toContain("⛔ #3 Write · protected path (.env) (protected-paths)");
+    expect(text).not.toContain("\\bDROP");
+  });
+
   it("sessionIds preserves first-seen order", () => {
     const repo = tempRepo();
     appendLedger(repo, { ts: "t0", sessionId: "b", event: "pre", action: "allow" });

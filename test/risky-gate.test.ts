@@ -97,6 +97,26 @@ describe("inbox ranking", () => {
     expect(renderInbox(buildInbox([]))).toContain("empty");
     expect(renderInbox(buildInbox([mk(0, "high", 40, "git push origin main")]))).toContain("git push");
   });
+
+  it("marks a denied action (blocked) so it never reads as if it ran", () => {
+    const denied: LedgerEntry = { ...mk(1, "high", 80, "git push --force origin main"), action: "deny" };
+    const inbox = buildInbox([mk(0, "high", 40, "git push origin feature/x"), denied]);
+    expect(inbox.items.map((i) => i.blocked)).toEqual([true, false]);
+    const text = renderInbox(inbox);
+    expect(text).toContain("#1 Bash (blocked)");
+    expect(text).not.toContain("#0 Bash (blocked)");
+    expect(formatBatchCard(inbox).text).toContain("git push --force origin main (blocked)");
+  });
+
+  it("shows file paths repo-relative", () => {
+    const e: LedgerEntry = {
+      seq: 0, ts: "t", sessionId: "s", event: "pre", toolName: "Write", action: "allow",
+      toolInput: { file_path: "/work/acme/src/deploy.ts" },
+      risk: { level: "medium", score: 25, signals: [{ id: "x", level: "medium", reason: "r" }] },
+      prevHash: "p", hash: "h",
+    };
+    expect(buildInbox([e], "low", { repoRoot: "/work/acme" }).items[0]!.summary).toBe("src/deploy.ts");
+  });
 });
 
 describe("notify", () => {

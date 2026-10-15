@@ -2,7 +2,73 @@ import { describe, it, expect } from "vitest";
 import { existsSync, readFileSync, writeFileSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { runInit, mergeSettings } from "../src/init.js";
+import { DEFAULT_POLICY_YAML, STRICT_POLICY_YAML } from "../src/templates.js";
+import { loadPolicy, STRICT_PRESET_BLOCKED_COMMANDS } from "../src/policy.js";
+import { protectedPathsGuard } from "../src/guards/protected-paths.js";
 import { tempRepo } from "./helpers.js";
+
+describe("runInit --preset", () => {
+  const strictPatterns = STRICT_PRESET_BLOCKED_COMMANDS.map((r) => r.pattern);
+
+  it("writes the default policy when no preset is given", () => {
+    const repo = tempRepo();
+    const r = runInit(repo, { hookCommand: "node /abs/cli.js hook" });
+    expect(r.preset).toBe("default");
+    expect(readFileSync(join(repo, "bulkhead.yaml"), "utf8")).toBe(DEFAULT_POLICY_YAML);
+    const patterns = loadPolicy(repo).blockedCommands.map((b) => b.pattern);
+    for (const p of strictPatterns) expect(patterns).not.toContain(p);
+  });
+
+  it("writes the strict policy, and loading it enforces every strict rule", () => {
+    const repo = tempRepo();
+    const r = runInit(repo, { hookCommand: "node /abs/cli.js hook", preset: "strict" });
+    expect(r.preset).toBe("strict");
+    expect(r.policyCreated).toBe(true);
+    expect(readFileSync(join(repo, "bulkhead.yaml"), "utf8")).toBe(STRICT_POLICY_YAML);
+    const patterns = loadPolicy(repo).blockedCommands.map((b) => b.pattern);
+    expect(patterns).toEqual(expect.arrayContaining(strictPatterns));
+  });
+
+  it("rejects an unknown preset before writing anything", () => {
+    const repo = tempRepo();
+    expect(() =>
+      runInit(repo, { preset: "paranoid" as unknown as "strict" }),
+    ).toThrow(/Unknown preset "paranoid"\. Expected one of: default, strict\./);
+    expect(existsSync(join(repo, "bulkhead.yaml"))).toBe(false);
+    expect(existsSync(join(repo, ".claude", "settings.json"))).toBe(false);
+  });
+
+  it("keeps an existing policy when a different preset is requested without force", () => {
+    const repo = tempRepo();
+    runInit(repo, { hookCommand: "node /abs/cli.js hook" });
+    const r = runInit(repo, { hookCommand: "node /abs/cli.js hook", preset: "strict" });
+    expect(r.policyCreated).toBe(false);
+    expect(readFileSync(join(repo, "bulkhead.yaml"), "utf8")).toBe(DEFAULT_POLICY_YAML);
+  });
+
+  it("replaces an existing policy with the requested preset under force", () => {
+    const repo = tempRepo();
+    writeFileSync(join(repo, "bulkhead.yaml"), "version: 1\n# custom\n");
+    const r = runInit(repo, { hookCommand: "node /abs/cli.js hook", preset: "strict", force: true });
+    expect(r.policyCreated).toBe(true);
+    expect(readFileSync(join(repo, "bulkhead.yaml"), "utf8")).toBe(STRICT_POLICY_YAML);
+  });
+
+  it("still writes and upgrades .claude/settings.json, which the policy it installs protects", () => {
+    // settings.json is immutable to the GUARDED AGENT's tools. init is not a
+    // tool call — it writes the file directly — so install and re-init work.
+    const repo = tempRepo();
+    runInit(repo, { hookCommand: "old-cmd", preset: "strict" });
+    runInit(repo, { hookCommand: "new-cmd", preset: "strict" });
+    const settingsPath = join(repo, ".claude", "settings.json");
+    const settings = JSON.parse(readFileSync(settingsPath, "utf8"));
+    const commands = settings.hooks.PreToolUse.flatMap((m: any) => m.hooks.map((h: any) => h.command));
+    expect(commands).toEqual(["new-cmd pre"]);
+
+    const agentEdit = { toolName: "Edit", toolInput: { file_path: settingsPath, old_string: "a", new_string: "b" } };
+    expect(protectedPathsGuard(agentEdit, loadPolicy(repo)).action).toBe("deny");
+  });
+});
 
 describe("runInit", () => {
   it("creates policy, hooks, gitignore", () => {

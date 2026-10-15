@@ -6,11 +6,17 @@ import { spendDir } from "./paths.js";
 import { withFileLock, atomicWrite } from "./fs-lock.js";
 
 /**
- * Sum the cost of every assistant message in a Claude Code transcript.
+ * Sum the cost of every assistant message in a Claude Code session: the main
+ * transcript plus its subagents' transcripts.
  *
  * The transcript is JSONL; assistant lines carry `message.usage` and
  * `message.model`. We tolerate unknown shapes and partial lines — a transcript
  * being written concurrently must never crash the hook.
+ *
+ * Claude Code writes each subagent's turns (Task, Explore, custom agents) to
+ * its own file under `<session>/subagents/` beside the main transcript, so a
+ * cap that read only `transcript_path` would miss them. Spend that is never
+ * written to a transcript (e.g. the auto-mode classifier) isn't counted.
  */
 export function sessionCostFromTranscript(
   transcriptPath: string | undefined,
@@ -22,32 +28,33 @@ export function sessionCostFromTranscript(
     return { totalUsd: 0, byModel, unpricedModels: [] };
   }
 
-  let text: string;
-  try {
-    text = readFileSync(transcriptPath, "utf8");
-  } catch {
-    return { totalUsd: 0, byModel, unpricedModels: [] };
-  }
-
   // Claude Code streams a request as several assistant lines that share a
   // message.id, and the usage GROWS across flushes — the first line reports a
   // near-zero output count, the last reports the real total. So we keep the
   // LAST line per id (overwrite), and price lines that carry no id individually.
   const lastByKey = new Map<string, { model?: string; usage: Usage }>();
   const unkeyed: Array<{ model?: string; usage: Usage }> = [];
-  for (const line of text.split("\n")) {
-    const trimmed = line.trim();
-    if (!trimmed) continue;
-    let obj: unknown;
+  for (const path of [transcriptPath, ...subagentTranscripts(transcriptPath)]) {
+    let text: string;
     try {
-      obj = JSON.parse(trimmed);
+      text = readFileSync(path, "utf8");
     } catch {
-      continue; // partially-written final line, etc.
+      continue;
     }
-    const msg = extractAssistantMessage(obj);
-    if (!msg) continue;
-    if (msg.dedupeKey) lastByKey.set(msg.dedupeKey, { model: msg.model, usage: msg.usage });
-    else unkeyed.push({ model: msg.model, usage: msg.usage });
+    for (const line of text.split("\n")) {
+      const trimmed = line.trim();
+      if (!trimmed) continue;
+      let obj: unknown;
+      try {
+        obj = JSON.parse(trimmed);
+      } catch {
+        continue; // partially-written final line, etc.
+      }
+      const msg = extractAssistantMessage(obj);
+      if (!msg) continue;
+      if (msg.dedupeKey) lastByKey.set(msg.dedupeKey, { model: msg.model, usage: msg.usage });
+      else unkeyed.push({ model: msg.model, usage: msg.usage });
+    }
   }
 
   for (const msg of [...lastByKey.values(), ...unkeyed]) {
@@ -59,6 +66,20 @@ export function sessionCostFromTranscript(
 
   const totalUsd = Object.values(byModel).reduce((a, b) => a + b, 0);
   return { totalUsd, byModel, unpricedModels: [...unpriced] };
+}
+
+/** `<dir>/<session>.jsonl` → every `<dir>/<session>/subagents/*.jsonl`. */
+export function subagentTranscripts(transcriptPath: string): string[] {
+  if (!transcriptPath.endsWith(".jsonl")) return [];
+  const dir = join(transcriptPath.slice(0, -".jsonl".length), "subagents");
+  try {
+    return readdirSync(dir)
+      .filter((f) => f.endsWith(".jsonl"))
+      .sort()
+      .map((f) => join(dir, f));
+  } catch {
+    return [];
+  }
 }
 
 function extractAssistantMessage(

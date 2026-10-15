@@ -6,7 +6,15 @@ import {
   IMMUTABLE_PROTECTED_PATHS,
   type Policy,
 } from "../policy.js";
-import { isFileWriteTool, isBashTool, targetPaths, rmTargets } from "../extract.js";
+import {
+  expandHomePrefix,
+  isFileWriteTool,
+  isBashTool,
+  targetPaths,
+  rmTargets,
+  shellWriteTargets,
+  bulkheadSelfCommand,
+} from "../extract.js";
 import { HARD_LINK_SCAN_LIMIT, scanHardLinks } from "./hard-links.js";
 
 const GUARD = "protected-paths";
@@ -82,8 +90,9 @@ function workspaceBoundaryVerdict(
  * symlinked ancestor may reach another repository or host file. Configured
  * allow globs are evaluated only after that boundary.
  *
- * For Bash we cover the common destructive case — `rm` of a protected path —
- * but a shell can reach a file many ways we cannot see, so this guard is
+ * For Bash we cover `rm` of a protected path, the obvious shell writes, and
+ * Bulkhead's own installer (`init`/`uninstall`, which rewrite the policy and
+ * hooks) — but a shell can reach a file many ways we cannot see, so this guard is
  * containment for the obvious mistakes, not a sandbox. blocked-commands owns
  * the structured rm-outside-workspace check.
  *
@@ -150,7 +159,7 @@ export function protectedPathsGuard(call: ToolCall, policy: Policy): GuardVerdic
           action: "deny",
           guard: GUARD,
           rule: matchedRule(norm, [...IMMUTABLE_PROTECTED_PATHS]),
-          reason: `\`${rel || absPath}\` is part of Bulkhead's immutable policy/state boundary.`,
+          reason: `\`${rel || absPath}\` is part of Bulkhead's immutable policy/state/hook boundary.`,
         };
       }
     }
@@ -225,10 +234,27 @@ export function protectedPathsGuard(call: ToolCall, policy: Policy): GuardVerdic
   if (isBashTool(call.toolName)) {
     const cmd = call.toolInput?.command;
     if (typeof cmd === "string") {
+      // Bulkhead's own installer rewrites bulkhead.yaml and the hook wiring:
+      // `init --force` would reset the policy, `init --command true` or
+      // `uninstall` would unhook it. Same boundary as editing those files.
+      const self = bulkheadSelfCommand(cmd);
+      if (self) {
+        return {
+          action: "deny",
+          guard: GUARD,
+          rule: "bulkhead-self-install",
+          reason: `\`bulkhead ${self}\` rewrites Bulkhead's own policy and hooks — a human runs it from their own terminal, not the agent (denied by Bulkhead).`,
+        };
+      }
       const targets = rmTargets(cmd);
       if (targets) {
         for (const target of targets) {
-          const abs = resolve(root, target);
+          // `rm ~/code/thisrepo/prod` must resolve like the shell would, or
+          // the protected dir hides behind the home prefix. An unresolvable
+          // home (`~alice/x`) is denied by blocked-commands; nothing to match.
+          const expanded = expandHomePrefix(target);
+          if (expanded === null) continue;
+          const abs = resolve(root, expanded);
           const verdict = check(abs, "delete");
           if (verdict) {
             return {
@@ -236,6 +262,21 @@ export function protectedPathsGuard(call: ToolCall, policy: Policy): GuardVerdic
               reason: `\`rm\` targets protected path \`${target}\` (denied by Bulkhead).`,
             };
           }
+        }
+      }
+      // The obvious shell writes — redirections, tee, in-place sed/perl,
+      // cp/mv/install, truncate, dd, ln -f — get the same protected-path
+      // check as the file tools. Best effort: scripts and interpreters that
+      // write files are invisible here (a documented known miss).
+      for (const target of shellWriteTargets(cmd)) {
+        const expanded = expandHomePrefix(target);
+        if (expanded === null) continue;
+        const verdict = check(resolve(root, expanded), "write");
+        if (verdict) {
+          return {
+            ...verdict,
+            reason: `Shell command writes to protected path \`${target}\` (denied by Bulkhead).`,
+          };
         }
       }
     }

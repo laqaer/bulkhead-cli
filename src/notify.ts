@@ -20,8 +20,8 @@ export interface BatchCard {
   /** Plain-text body (console). */
   text: string;
   counts: Record<RiskLevel, number>;
-  /** The top few items, already ranked. */
-  top: Array<{ level: RiskLevel; score: number; summary: string; reasons: string[] }>;
+  /** The top few items, already ranked. `blocked`: Bulkhead denied it; it never ran. */
+  top: Array<{ level: RiskLevel; score: number; summary: string; reasons: string[]; blocked?: boolean }>;
 }
 
 /** Build a risk-ranked batch card from an inbox — the thing you review. */
@@ -32,12 +32,13 @@ export function formatBatchCard(inbox: Inbox, opts: { maxItems?: number; label?:
     score: it.score,
     summary: it.summary,
     reasons: it.reasons,
+    blocked: it.blocked,
   }));
   const label = opts.label ? `${opts.label} — ` : "";
   const title = `${label}Bulkhead: ${inbox.counts.high} high · ${inbox.counts.medium} medium · ${inbox.counts.low} low risk action(s)`;
   const lines = [title, ""];
   for (const it of top) {
-    lines.push(`• [${it.level} ${it.score}] ${it.summary}`);
+    lines.push(`• [${it.level} ${it.score}] ${it.summary}${it.blocked ? " (blocked)" : ""}`);
     lines.push(`    ${it.reasons.join("; ")}`);
   }
   if (inbox.items.length > top.length) {
@@ -70,7 +71,10 @@ export class WebhookChannel implements NotifyChannel {
     for (const it of card.top) {
       blocks.push({
         type: "section",
-        text: { type: "mrkdwn", text: `*[${it.level} ${it.score}]* ${slackEscape(it.summary)}\n${slackEscape(it.reasons.join("; "))}` },
+        text: {
+          type: "mrkdwn",
+          text: `*[${it.level} ${it.score}]* ${slackEscape(it.summary)}${it.blocked ? " _(blocked)_" : ""}\n${slackEscape(it.reasons.join("; "))}`,
+        },
       });
     }
     const res = await this.fetchImpl(this.url, {

@@ -1,5 +1,6 @@
 import type { RiskAssessment, RiskLevel, RiskSignal, ToolCall } from "./types.js";
 import { commandSegments } from "./evidence.js";
+import { isCredentialStorePath, shellReadTargets } from "./extract.js";
 
 export type { RiskAssessment, RiskLevel, RiskSignal } from "./types.js";
 
@@ -112,6 +113,15 @@ function collectBashSignals(command: string, signals: RiskSignal[]): void {
   const noQuotes = command.replace(/"(?:[^"\\]|\\.)*"|'[^']*'/g, " ");
   if (/(^|[|&;\n]\s*)(sudo|doas)\b/.test(noQuotes)) {
     signals.push({ id: "privilege", level: "high", reason: "runs with elevated privileges (sudo/doas)" });
+  }
+
+  // Credential read: printing or copying a file that exists to hold secrets
+  // puts them where they can leave the machine. Quoted paths count, so this
+  // reads the command with its own tokenizer rather than commandSegments, which
+  // drops quoted words. One signal per command, however many files.
+  const credentialFile = shellReadTargets(command).find(isCredentialStorePath);
+  if (credentialFile !== undefined) {
+    signals.push({ id: "credential-read", level: "high", reason: `reads a credential file (${credentialFile})` });
   }
 
   const segments = commandSegments(command);

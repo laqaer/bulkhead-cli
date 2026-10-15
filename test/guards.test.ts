@@ -1,14 +1,17 @@
-import { describe, it, expect } from "vitest";
+import { afterEach, describe, it, expect, vi } from "vitest";
 import {
   chmodSync,
   linkSync,
   mkdirSync,
+  mkdtempSync,
   realpathSync,
   rmSync,
   symlinkSync,
+  unlinkSync,
   writeFileSync,
 } from "node:fs";
-import { join } from "node:path";
+import { tmpdir } from "node:os";
+import { basename, dirname, join } from "node:path";
 import { defaultPolicy } from "../src/policy.js";
 import { protectedPathsGuard } from "../src/guards/protected-paths.js";
 import { scanHardLinks } from "../src/guards/hard-links.js";
@@ -17,6 +20,21 @@ import { budgetGuard } from "../src/guards/budget.js";
 import { loopCheck, emptyLoopState, signatureFor } from "../src/guards/loop.js";
 import type { ToolCall } from "../src/types.js";
 import { tempRepo } from "./helpers.js";
+
+// os.homedir() is stubbed for the home-expansion tests, so they do not depend
+// on where the machine running them keeps its home directory (or whether the
+// temp dir happens to live under it). `dir: undefined` means the real one.
+const home = vi.hoisted(() => ({ dir: undefined as string | undefined, fail: false }));
+vi.mock("node:os", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:os")>();
+  return {
+    ...actual,
+    homedir: () => {
+      if (home.fail) throw new Error("home directory unavailable");
+      return home.dir ?? actual.homedir();
+    },
+  };
+});
 
 const ROOT = "/repo";
 const policy = defaultPolicy(ROOT);
@@ -119,9 +137,8 @@ describe("protected-paths guard", () => {
 // (deny-widening only: resolution may create denies, never remove them).
 //
 // These tests run against a real filesystem because symlink resolution is the
-// thing under test. tempRepo() lives under macOS /var (-> /private/var), so
-// every expectation here is also exercised across a root that differs from
-// its own realpath.
+// thing under test. An explicit directory alias keeps every expectation below
+// on a workspace root that differs from its real path, on every platform.
 // ---------------------------------------------------------------------------
 describe("protected-paths: symlink resolution (F1)", () => {
   // Layout per test:
@@ -132,14 +149,19 @@ describe("protected-paths: symlink resolution (F1)", () => {
   //   repo/settings.conf   -> .env      (file symlink)
   //   repo/srclink         -> realsrc   (dir symlink to an allowed target)
   function setup(): { repo: string; cleanup: () => void } {
-    const repo = tempRepo();
+    const holder = tempRepo();
+    const target = join(holder, "workspace");
+    mkdirSync(target);
+    const repo = join(holder, "alias");
+    symlinkSync(realpathSync(target), repo, "junction");
+    expect(repo).not.toBe(realpathSync(repo));
     mkdirSync(join(repo, "prod"));
     mkdirSync(join(repo, "realsrc"));
     writeFileSync(join(repo, ".env"), "S=1");
     symlinkSync(join(repo, "prod"), join(repo, "gate"));
     symlinkSync(join(repo, ".env"), join(repo, "settings.conf"));
     symlinkSync(join(repo, "realsrc"), join(repo, "srclink"));
-    return { repo, cleanup: () => rmSync(repo, { recursive: true, force: true }) };
+    return { repo, cleanup: () => rmSync(holder, { recursive: true, force: true }) };
   }
 
   it("denies Write through a dir symlink into a protected dir", () => {
@@ -375,6 +397,260 @@ describe("blocked-commands guard", () => {
   });
 });
 
+// Regression: `resolve(root, "~/backups")` treats `~` as a directory named `~`
+// INSIDE the repo, so `rm -rf ~/backups` and `rm -rf "$HOME/..."` passed the
+// outside-the-workspace check. Only an exact `~` or `~/` was special-cased.
+describe("rm: home-directory targets are expanded before the workspace test", () => {
+  afterEach(() => {
+    home.dir = undefined;
+    home.fail = false;
+  });
+
+  it.each([
+    "rm -rf ~/backups",
+    "rm -rf $HOME/backups",
+    'rm -rf "$HOME/backups"',
+    "rm -rf ${HOME}/backups",
+    'rm -rf "${HOME}/x"',
+    'rm -rf "$HOME/Library/Application Support"',
+    "rm -rf ~/*",
+    "rm -rf tests/ patches/ plan/ ~/",
+  ])("denies %s when the repo is not under that path", (cmd) => {
+    home.dir = "/home/dev";
+    const v = blockedCommandsGuard(bash(cmd), policy);
+    expect(v.action).toBe("deny");
+    expect(v.rule).toBe("rm-outside-workspace");
+  });
+
+  it.each([
+    "rm -rf ~/.npm/_npx",
+    "rm -rf ~/.npm/_cacache",
+    "rm -rf ~/.cache/pip",
+    "rm -rf $HOME/.cache/huggingface/hub",
+    "rm -rf ~/Library/Caches/ms-playwright",
+    "rm -rf /tmp/build-cache",
+    "rm -rf /var/tmp/vite-123",
+  ])("allows clearing a regenerable cache or temp dir: %s", (cmd) => {
+    home.dir = "/home/dev";
+    expect(blockedCommandsGuard(bash(cmd), policy).action).toBe("allow");
+  });
+
+  it.each([
+    "rm -rf /tmp",
+    "rm -rf /tmp/*",
+    "rm -rf ~/.cache",
+    "rm -rf ~/.npm",
+    "rm -rf /tmp/../home/dev/work",
+    "rm -rf ~/.cache/../projects",
+  ])("still denies the scratch roots themselves, globs and escapes: %s", (cmd) => {
+    home.dir = "/home/dev";
+    expect(blockedCommandsGuard(bash(cmd), policy).rule).toBe("rm-outside-workspace");
+  });
+
+  it("follows a symlink in /tmp to its real location", () => {
+    const outside = mkdtempSync(join(tmpdir(), "bh-outside-"));
+    const target = join(outside, "work");
+    mkdirSync(target);
+    const link = join(tmpdir(), `bh-link-${basename(outside)}`);
+    symlinkSync(target, link);
+    // The link lives in a temp root but points into another temp dir: allowed.
+    expect(blockedCommandsGuard(bash(`rm -rf ${link}/`), policy).action).toBe("allow");
+    unlinkSync(link); // remove the link itself; rmSync rejects a link to a directory on macOS
+    home.dir = "/home/dev";
+    // A link in /tmp pointing at a non-scratch location is denied.
+    const evil = join(tmpdir(), `bh-evil-${basename(outside)}`);
+    symlinkSync("/etc", evil);
+    expect(blockedCommandsGuard(bash(`rm -rf ${evil}/`), policy).action).toBe("deny");
+    unlinkSync(evil);
+  });
+
+  it.each(["rm -rf ~", "rm -rf ~/", "rm -rf $HOME", 'rm -rf "${HOME}/"'])(
+    "names the home directory itself: %s",
+    (cmd) => {
+      home.dir = "/home/dev";
+      const v = blockedCommandsGuard(bash(cmd), policy);
+      expect(v.action).toBe("deny");
+      expect(v.reason).toContain("targets the home directory");
+    },
+  );
+
+  it("denies with the REAL home directory too (no stub)", () => {
+    // /repo is never anyone's home, so ~/backups is outside it on any machine.
+    expect(blockedCommandsGuard(bash("rm -rf ~/backups"), policy).action).toBe("deny");
+    expect(blockedCommandsGuard(bash('rm -rf "$HOME/backups"'), policy).action).toBe("deny");
+  });
+
+  describe("when the repo lives under the home directory", () => {
+    // home = the temp repo's parent, so ~/<name> IS the workspace: the case
+    // of a repo checked out at ~/code/thisrepo.
+    function setup(): { repo: string; name: string; cleanup: () => void } {
+      const repo = tempRepo();
+      home.dir = dirname(repo);
+      return {
+        repo,
+        name: basename(repo),
+        cleanup: () => rmSync(repo, { recursive: true, force: true }),
+      };
+    }
+
+    it("still allows an in-repo cleanup spelled through ~ or $HOME", () => {
+      const { repo, name, cleanup } = setup();
+      try {
+        const p = defaultPolicy(repo);
+        for (const cmd of [
+          `rm -rf ~/${name}/dist`,
+          `rm -rf $HOME/${name}/node_modules`,
+          `rm -rf "\${HOME}/${name}/.next"`,
+          `rm -rf ~/${name}/build ~/${name}/coverage`,
+        ]) {
+          expect(blockedCommandsGuard(bash(cmd), p).action, cmd).toBe("allow");
+        }
+      } finally {
+        cleanup();
+      }
+    });
+
+    it("denies the workspace root itself, a sibling, and a .. escape", () => {
+      const { repo, name, cleanup } = setup();
+      try {
+        const p = defaultPolicy(repo);
+        for (const cmd of [
+          `rm -rf ~/${name}`,
+          `rm -rf ~/${name}/`,
+          `rm -rf ~/some-other-repo/dist`,
+          `rm -rf ~/${name}/../other`,
+          "rm -rf ~/backups",
+        ]) {
+          expect(blockedCommandsGuard(bash(cmd), p).action, cmd).toBe("deny");
+        }
+      } finally {
+        cleanup();
+      }
+    });
+
+    it("resolves ~ for the protected-path check too, so ~/<repo>/prod is still protected", () => {
+      const { repo, name, cleanup } = setup();
+      try {
+        const p = defaultPolicy(repo);
+        const call = bash(`rm -rf ~/${name}/prod`);
+        // Inside the workspace, so the rm-outside check has no objection...
+        expect(blockedCommandsGuard(call, p).action).toBe("allow");
+        // ...but prod/** is protected, however the path is spelled.
+        expect(protectedPathsGuard(call, p).action).toBe("deny");
+        expect(protectedPathsGuard(bash(`rm -rf $HOME/${name}/.env`), p).action).toBe("deny");
+      } finally {
+        cleanup();
+      }
+    });
+  });
+
+  it.each(["rm -rf ~alice/backups", "rm -rf ~root", "rm -rf ~+/dist", "rm -rf ~-/x"])(
+    "denies a home it cannot resolve: %s",
+    (cmd) => {
+      home.dir = "/home/dev";
+      const v = blockedCommandsGuard(bash(cmd), policy);
+      expect(v.action).toBe("deny");
+      expect(v.reason).toContain("cannot resolve");
+    },
+  );
+
+  it("fails closed when the home directory cannot be determined", () => {
+    home.fail = true;
+    expect(blockedCommandsGuard(bash("rm -rf ~/backups"), policy).action).toBe("deny");
+    expect(blockedCommandsGuard(bash("rm -rf $HOME/x"), policy).action).toBe("deny");
+    // A target with no home prefix never needed the lookup.
+    expect(blockedCommandsGuard(bash("rm -rf build/"), policy).action).toBe("allow");
+
+    home.fail = false;
+    home.dir = "";
+    expect(blockedCommandsGuard(bash("rm -rf ~/backups"), policy).action).toBe("deny");
+  });
+
+  it("does not expand a ~ or $HOME that is not a leading prefix", () => {
+    // The shell does not expand these either; they are in-repo paths.
+    home.dir = "/home/dev";
+    expect(blockedCommandsGuard(bash("rm -rf build/~tmp"), policy).action).toBe("allow");
+    expect(blockedCommandsGuard(bash("rm -rf ./~/x"), policy).action).toBe("allow");
+  });
+});
+
+// The agent could edit its own hooks out: Claude Code loads the hooks that run
+// Bulkhead from .claude/settings.json (and .local.json), which were ordinary
+// writable files. They are now in the immutable self-protection boundary.
+describe("protected-paths: the Claude Code settings files that load Bulkhead's hooks", () => {
+  function edit(path: string): ToolCall {
+    return { toolName: "Edit", toolInput: { file_path: path, old_string: '"PreToolUse"', new_string: '"Disabled"' } };
+  }
+
+  it.each([
+    "/repo/.claude/settings.json",
+    "/repo/.claude/settings.local.json",
+    "/repo/.Claude/Settings.json",
+    "/repo/.claude/SETTINGS.LOCAL.JSON",
+  ])("denies Write and Edit to %s", (path) => {
+    for (const call of [write(path), edit(path)]) {
+      const v = protectedPathsGuard(call, policy);
+      expect(v.action).toBe("deny");
+      expect(v.reason).toContain("immutable");
+    }
+  });
+
+  it.each([
+    "rm .claude/settings.json",
+    "rm -f .claude/settings.local.json",
+    "rm -rf .claude",
+    "rm -rf .claude/",
+  ])("denies %s", (cmd) => {
+    expect(protectedPathsGuard(bash(cmd), policy).action).toBe("deny");
+  });
+
+  it.each([
+    "/repo/.claude/commands/review.md",
+    "/repo/.claude/agents/tester.md",
+    "/repo/.claude/CLAUDE.md",
+    "/repo/CLAUDE.md",
+    "/repo/.claude/settings.json.bak",
+  ])("keeps the rest of .claude/ writable: %s", (path) => {
+    expect(protectedPathsGuard(write(path), policy).action).toBe("allow");
+  });
+
+  it("keeps rm of an ordinary .claude/ subdirectory allowed", () => {
+    expect(protectedPathsGuard(bash("rm -rf .claude/commands/old"), policy).action).toBe("allow");
+  });
+
+  it("cannot be exempted by an allow rule", () => {
+    const p = defaultPolicy(ROOT);
+    p.protectedPaths.allow = [".claude/**", ".claude/settings.json"];
+    expect(protectedPathsGuard(write("/repo/.claude/settings.json"), p).action).toBe("deny");
+    expect(protectedPathsGuard(write("/repo/.claude/settings.local.json"), p).action).toBe("deny");
+    // The allow rule still works for the paths it may legitimately cover.
+    expect(protectedPathsGuard(write("/repo/.claude/commands/x.md"), p).action).toBe("allow");
+  });
+});
+
+// A `+` on a refspec forces that ref with no --force flag at all, so the
+// structured check used to wave `git push origin +main` through.
+describe("force-push through a +refspec", () => {
+  it.each([
+    "git push origin +main",
+    "git push origin +HEAD:main",
+    "git push origin +refs/heads/master",
+    "git push origin +feature:main",
+    "git push --force-with-lease origin +main",
+  ])("denies %s", (cmd) => {
+    const v = blockedCommandsGuard(bash(cmd), policy);
+    expect(v.action).toBe("deny");
+    expect(v.rule).toBe("force-push-protected-branch");
+  });
+
+  it.each(["git push origin +feature/login", "git push origin +main-nav", "git push origin main"])(
+    "leaves %s to the default policy (allowed)",
+    (cmd) => {
+      expect(blockedCommandsGuard(bash(cmd), policy).action).toBe("allow");
+    },
+  );
+});
+
 describe("budget guard", () => {
   const base = { byModel: {}, unpricedModels: [] };
   it("denies when session cap is reached", () => {
@@ -596,6 +872,108 @@ describe("protected-paths: hard links (issue #3)", () => {
     }
   });
 
+  it.each(["glob", "exact", "parent"] as const)(
+    "finds a case-variant anchored static prefix (%s)",
+    (kind) => {
+      const repo = tempRepo();
+      try {
+        const workspace = join(repo, "workspace");
+        const secret = join(repo, "secrets", "nested", "key.pem");
+        mkdirSync(workspace);
+        mkdirSync(join(repo, "secrets", "nested"), { recursive: true });
+        writeFileSync(secret, "secret");
+        const alias = join(workspace, "copy.txt");
+        linkSync(secret, alias);
+        const p = defaultPolicy(workspace);
+        const pattern = kind === "exact"
+          ? join(repo, "SECRETS", "NESTED", "KEY.PEM")
+          : kind === "parent" ? "../SECRETS/NESTED/**" : join(repo, "SECRETS", "NESTED", "**");
+        p.protectedPaths.deny = [pattern.split("\\").join("/")];
+        if (kind === "parent") {
+          const scan = scanHardLinks(realpathSync(alias), {
+            root: workspace,
+            rootReal: realpathSync(workspace),
+            patterns: p.protectedPaths.deny,
+            classify: () => ({ action: "deny", guard: "protected-paths" }),
+            limit: 20_000,
+          });
+          expect(scan.kind).toBe("alias");
+          if (scan.kind === "alias") expect(realpathSync(scan.path)).toBe(realpathSync(secret));
+          return;
+        }
+        // The direct name already matches the deny semantics. The alias must
+        // be found by identity, rather than denied merely as unverifiable.
+        const v = protectedPathsGuard(write(alias), p);
+        expect(v.action).toBe("deny");
+        expect(v.rule).toBe(p.protectedPaths.deny[0]);
+        expect(v.reason).toContain("hard link to");
+      } finally {
+        rmSync(repo, { recursive: true, force: true });
+      }
+    },
+  );
+
+  it("enumerates every case-colliding prefix, including an alternate existing directory", () => {
+    const repo = tempRepo();
+    try {
+      const workspace = join(repo, "workspace");
+      mkdirSync(workspace);
+      mkdirSync(join(repo, "SECRETS"));
+      // Both names coexist on case-sensitive volumes. On other volumes this
+      // still checks case-insensitive discovery of the one existing entry.
+      mkdirSync(join(repo, "secrets"), { recursive: true });
+      const secret = join(repo, "secrets", "key.pem");
+      writeFileSync(secret, "secret");
+      const alias = join(workspace, "copy.txt");
+      linkSync(secret, alias);
+      const p = defaultPolicy(workspace);
+      p.protectedPaths.deny = [join(repo, "SECRETS", "**").split("\\").join("/")];
+      const v = protectedPathsGuard(write(alias), p);
+      expect(v.rule).toBe(p.protectedPaths.deny[0]);
+      expect(v.reason).toContain("hard link to");
+    } finally {
+      rmSync(repo, { recursive: true, force: true });
+    }
+  });
+
+  it("preserves static symlink ancestors but does not follow symlinks in the glob", () => {
+    const repo = tempRepo();
+    try {
+      const workspace = join(repo, "workspace");
+      const host = join(repo, "host");
+      mkdirSync(workspace);
+      mkdirSync(host);
+      writeFileSync(join(host, "key.pem"), "secret");
+      const alias = join(workspace, "copy.txt");
+      linkSync(join(host, "key.pem"), alias);
+      symlinkSync(host, join(repo, "static-link"), "junction");
+      const p = defaultPolicy(workspace);
+      p.protectedPaths.deny = [join(repo, "STATIC-LINK", "**").split("\\").join("/")];
+      expect(protectedPathsGuard(write(alias), p).rule).toBe(p.protectedPaths.deny[0]);
+      p.protectedPaths.deny = [join(repo, "static-*", "**").split("\\").join("/")];
+      expect(protectedPathsGuard(write(alias), p).action).toBe("allow");
+    } finally {
+      rmSync(repo, { recursive: true, force: true });
+    }
+  });
+
+  it("counts anchored prefix entries toward the shared fail-closed scan budget", () => {
+    const { repo, cleanup } = setup();
+    try {
+      const target = realpathSync(join(repo, "hardcopy.conf"));
+      const opts = {
+        root: repo,
+        rootReal: realpathSync(repo),
+        patterns: [join(repo, ".env").split("\\").join("/")],
+        classify: () => ({ action: "deny" as const, guard: "protected-paths" }),
+      };
+      expect(scanHardLinks(target, { ...opts, limit: 0 }).kind).toBe("unverifiable");
+      expect(scanHardLinks(target, { ...opts, limit: 20_000 }).kind).toBe("alias");
+    } finally {
+      cleanup();
+    }
+  });
+
   it("cannot hard-link a directory, so no new file can be created inside prod/", () => {
     const { repo, cleanup } = setup();
     try {
@@ -609,5 +987,18 @@ describe("protected-paths: hard links (issue #3)", () => {
     } finally {
       cleanup();
     }
+  });
+});
+
+describe("template env files are allowed by default", () => {
+  it("Write .env.example is allowed; .env and .env.production stay protected", () => {
+    const repo = tempRepo();
+    const policy = defaultPolicy(repo);
+    const write = (p: string) => protectedPathsGuard({ toolName: "Write", toolInput: { file_path: `${repo}/${p}`, content: "X=" } }, policy).action;
+    expect(write(".env.example")).toBe("allow");
+    expect(write(".env.sample")).toBe("allow");
+    expect(write(".env.template")).toBe("allow");
+    expect(write(".env")).toBe("deny");
+    expect(write(".env.production")).toBe("deny");
   });
 });

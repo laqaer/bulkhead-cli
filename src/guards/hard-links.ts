@@ -1,5 +1,5 @@
 import { lstatSync, readdirSync, realpathSync, statSync, type Dirent } from "node:fs";
-import { basename, dirname, join, resolve } from "node:path";
+import { basename, dirname, isAbsolute, join, parse, resolve, sep } from "node:path";
 import picomatch from "picomatch";
 import type { GuardVerdict } from "../types.js";
 
@@ -46,10 +46,11 @@ export interface HardLinkScanOptions {
  * link created after the policy was loaded — or between two tool calls — is
  * seen by the next check.
  *
- * Enumeration walks canonical entries only and never follows symlinks. A
+ * Enumeration never follows symlinks in the glob portion of a pattern. A
  * symlink is not a name for the inode, and following one would let a link
  * planted inside a protected directory drag unrelated files into the
- * protected set. Symlink aliases are already covered by realpath matching.
+ * protected set. Explicit static symlink ancestors retain their path meaning;
+ * symlink aliases are already covered by realpath matching.
  */
 export function scanHardLinks(targetReal: string, opts: HardLinkScanOptions): HardLinkScan {
   let target;
@@ -78,16 +79,19 @@ export function scanHardLinks(targetReal: string, opts: HardLinkScanOptions): Ha
  */
 type Segment = ((name: string) => boolean) | null;
 
+type WalkPattern = { segments: Segment[]; staticDepth: number };
+
 /** Same flags as the deny matcher, so pruning never disagrees with matching. */
 const SEGMENT_OPTS = { dot: true, nocase: true } as const;
 
 /** Group every protected glob by the directory its walk starts from. */
-function walkPlan(opts: HardLinkScanOptions): Map<string, Segment[][]> {
-  const plan = new Map<string, Segment[][]>();
-  const add = (start: string, segs: Segment[]): void => {
+function walkPlan(opts: HardLinkScanOptions): Map<string, WalkPattern[]> {
+  const plan = new Map<string, WalkPattern[]>();
+  const add = (start: string, segs: Segment[], staticDepth = 0): void => {
+    const pattern = { segments: segs, staticDepth };
     const list = plan.get(start);
-    if (list) list.push(segs);
-    else plan.set(start, [segs]);
+    if (list) list.push(pattern);
+    else plan.set(start, [pattern]);
   };
 
   for (const pattern of new Set(opts.patterns)) {
@@ -99,17 +103,26 @@ function walkPlan(opts: HardLinkScanOptions): Map<string, Segment[][]> {
     const rel = pattern.replace(/^(?:\.\/)+/, "");
     // Relative globs are walked from the root segment by segment, so a
     // case-variant glob (`PROD/**`) still finds `prod/` on any volume.
-    // Absolute and `../`-anchored globs name a fixed location — possibly
-    // outside the workspace — so their walk starts at the literal static base.
-    const anchored = rel.startsWith("/") || rel === ".." || rel.startsWith("../");
+    // Absolute paths include Windows drive roots. Anchored static prefixes
+    // must be enumerated with nocase matching too, rather than opened literally.
+    const absolute = isAbsolute(rel);
+    const anchored = absolute || rel === ".." || rel.startsWith("../");
     if (!anchored) {
       add(opts.root, segments(rel));
       continue;
     }
     const scan = picomatch.scan(rel);
-    const base = rel.startsWith("/") ? scan.base || "/" : resolve(opts.rootReal, scan.base);
-    if (scan.glob) add(base, segments(scan.glob));
-    else if (basename(base)) add(dirname(base), segments(basename(base))); // exact path: its leaf
+    // Resolve a bare drive base (`C:` from `C:/**`) against the pattern's
+    // root, never against that drive's current working directory.
+    const base = absolute
+      ? resolve(parse(rel).root, scan.base || parse(rel).root)
+      : resolve(opts.rootReal, scan.base);
+    const dir = scan.glob ? base : dirname(base);
+    const root = parse(dir).root;
+    const prefix = dir.slice(root.length).split(sep).join("/");
+    const glob = scan.glob || basename(base);
+    if (!glob) continue; // a filesystem root alone cannot name a file alias
+    add(root, segments(prefix ? `${prefix}/${glob}` : glob), prefix ? prefix.split("/").length : 0);
   }
   return plan;
 }
@@ -146,7 +159,7 @@ type Found =
 
 function walk(
   start: string,
-  patterns: Segment[][],
+  patterns: WalkPattern[],
   target: { dev: bigint; ino: bigint },
   targetReal: string,
   opts: HardLinkScanOptions,
@@ -172,10 +185,23 @@ function walk(
           detail: `scan stopped after ${opts.limit} directory entries`,
         };
       }
-      if (entry.isSymbolicLink()) continue;
       const childRel = [...rel, entry.name];
+      if (entry.isSymbolicLink()) {
+        // Literal static ancestors were traversed by the old scan base (e.g.
+        // macOS /tmp). Preserve that behavior, but never follow glob matches.
+        // Their finite prefix depth and the shared entry budget bound the walk.
+        if (patterns.some((p) => childRel.length <= p.staticDepth && mayContainMatch(p.segments, childRel))) {
+          const path = join(dir, entry.name);
+          try {
+            if (statSync(path).isDirectory()) stack.push(childRel);
+          } catch (err) {
+            if (!vanished(err)) return { kind: "unverifiable", detail: `cannot stat \`${path}\` (${errCode(err)})` };
+          }
+        }
+        continue;
+      }
       if (entry.isDirectory()) {
-        if (patterns.some((p) => mayContainMatch(p, childRel))) stack.push(childRel);
+        if (patterns.some((p) => mayContainMatch(p.segments, childRel))) stack.push(childRel);
         continue;
       }
       const path = join(dir, entry.name);

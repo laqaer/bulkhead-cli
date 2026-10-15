@@ -1,11 +1,11 @@
 {
   "name": "@bulkheadtools/cli",
-  "version": "0.1.3",
-  "description": "Deterministic guardrails, evidence ledger, and budget hard-caps for AI coding agents. Installs into Claude Code hooks in one command. Containment and evidence — not a firewall.",
+  "version": "0.2.0",
+  "description": "Claude Code hooks that keep receipts: deterministic guardrails (incident-pack command rules, protected paths, $ caps, loop freeze), completion verification, and a tamper-evident ledger. One command. Containment and evidence — not a firewall.",
   "license": "MIT",
   "type": "module",
   "bin": {
-    "bulkhead": "./dist/cli.js"
+    "bulkhead": "dist/cli.js"
   },
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
@@ -27,10 +27,18 @@
   },
   "keywords": [
     "claude-code",
-    "ai-agents",
-    "guardrails",
+    "claude-code-hooks",
     "hooks",
-    "audit",
+    "pretooluse",
+    "guardrails",
+    "ai-agents",
+    "coding-agent",
+    "audit-log",
+    "ledger",
+    "cost-limit",
+    "completion-verification",
+    "dangerously-skip-permissions",
+    "auto-mode",
     "safety",
     "containment"
   ],

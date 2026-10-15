@@ -47,10 +47,11 @@ export interface VerifyConfig {
   /**
    * off   — no completion verification.
    * note  — record claim-vs-evidence verdicts in the ledger, never block.
-   * block — additionally refuse to let the session stop when a claim is
-   *         CONTRADICTED by evidence (e.g. "tests pass" but the latest test run
-   *         failed). Missing evidence is only noted, never blocked — that keeps
-   *         the false-positive surface near zero.
+   * block — additionally send the agent back to work (once — a retried stop
+   *         is recorded, not blocked) when a claim is CONTRADICTED by evidence
+   *         (e.g. "tests pass" but the latest test run failed). Missing
+   *         evidence is only noted unless `blockOnMissing` — that keeps the
+   *         false-positive surface near zero.
    */
   mode: "off" | "note" | "block";
   /** Escalate missing-evidence verdicts to blocks too (strict teams only). */
@@ -114,14 +115,35 @@ export interface Policy {
 /**
  * These paths protect the guardrail itself. They are evaluated before user
  * allow exceptions, so an agent cannot carve them back out through policy.
+ *
+ * `.claude/settings.json` and `.claude/settings.local.json` are where Claude
+ * Code reads the project's hooks — the ones that run Bulkhead. An agent that
+ * can edit them can delete its own guardrail (or set `disableAllHooks`), so
+ * they sit in the same boundary as the policy file. `.claude` itself is listed
+ * so `rm -rf .claude` is caught the way `rm -rf .bulkhead` is. The rest of
+ * `.claude/**` (commands, agents, CLAUDE.md) stays writable: agents edit those
+ * legitimately, and none of them can switch hooks off.
+ *
+ * `bulkhead init` writes settings.json with plain file I/O, outside any hook,
+ * so installing or upgrading is unaffected.
  */
 export const IMMUTABLE_PROTECTED_PATHS = [
   "bulkhead.yaml",
   ".bulkhead",
   ".bulkhead/**",
+  ".claude",
+  ".claude/settings.json",
+  ".claude/settings.local.json",
 ] as const;
 
-const BUILTIN_PROTECTED_PATHS = [
+/**
+ * Template env files: checked in on purpose, no secrets by convention, and
+ * written in ordinary work. Carved out of `.env.*` by default; the policy file
+ * lists them under `allow`, so a team can take them back out.
+ */
+export const DEFAULT_ALLOWED_PATHS = [".env.example", ".env.sample", ".env.template"] as const;
+
+export const BUILTIN_PROTECTED_PATHS = [
   "prod/**",
   "migrations/**",
   ".env",
@@ -129,17 +151,263 @@ const BUILTIN_PROTECTED_PATHS = [
   ...IMMUTABLE_PROTECTED_PATHS,
 ] as const;
 
-const BUILTIN_BLOCKED_COMMANDS: ReadonlyArray<BlockedCommandRule> = [
-  { pattern: "\\bDROP\\s+TABLE\\b", message: "SQL DROP TABLE" },
-  { pattern: "\\bDROP\\s+DATABASE\\b", message: "SQL DROP DATABASE" },
-  { pattern: "\\bTRUNCATE\\s+TABLE\\b", message: "SQL TRUNCATE TABLE" },
-  { pattern: "\\bmkfs\\.[a-z0-9]+\\b", message: "Filesystem format" },
+/**
+ * A shipped command rule. `prose` marks a rule that describes destructive
+ * *content* — a statement or CLI invocation that can appear verbatim in text
+ * that merely talks about it (`grep -rn "terraform destroy" docs/`). Only those
+ * may be skipped for a provably inert, text-only command; see
+ * guards/blocked-commands.ts. The flag never leaves this file: the exported
+ * lists are plain BlockedCommandRules, and the skip is keyed on the exact
+ * pattern string so it also reaches rules loaded back from a user's
+ * bulkhead.yaml.
+ */
+interface ShippedRule extends BlockedCommandRule {
+  message: string;
+  prose: boolean;
+}
+
+// Regex fragments shared by the rules below, written with String.raw so each
+// reads exactly as the regex it becomes. SEG keeps a match inside one simple
+// command (and one line), so a flag in the NEXT command of a `&&` chain cannot
+// complete it, and a large heredoc costs at most line-length work per match
+// attempt. No rule nests quantifiers over overlapping characters, so none of
+// them can backtrack catastrophically; test/incident-pack.test.ts pins a
+// timing bound on adversarial input.
+const SEG = String.raw`[^\n;&|]*`;
+/**
+ * Up to 8 whitespace-separated tokens on one line (git's global options, or
+ * the arguments between `reset` and `--hard`). Bounded so a line that repeats
+ * `git` thousands of times stays linear instead of rescanning to the end.
+ */
+const TOKENS = String.raw`(?:[^\s;&|]+[ \t]+){0,8}?`;
+/** One SQL identifier: bare, "double-quoted", `backticked` or [bracketed]. */
+const SQL_IDENT = String.raw`(?:\\?"[\w$ ]+\\?"|\x60[\w$ ]+\x60|\[[\w$ ]+\]|[\w$]+)`;
+/** A bare Windows drive root as one argument: `d:\`, `D:/`, quoted or not. */
+const DRIVE_ROOT = String.raw`["']?[A-Za-z]:[\\/]+["']?(?=[\s;&|)]|$)`;
+/** A loopback host: localhost, *.localhost, 127.x.x.x, 0.0.0.0 or [::1]. */
+const LOOPBACK = String.raw`(?:(?:[\w-]+\.)*localhost|127(?:\.\d{1,3}){3}|0\.0\.0\.0|\[::1\])(?![\w.-])`;
+
+/**
+ * Always-on command rules. Conservative on purpose: each names one
+ * unambiguously destructive operation, so ordinary dev work never trips it.
+ * The incident pack (everything after the fork bomb) covers the shapes behind
+ * publicly reported agent disasters — src/corpus.ts pins every one of them.
+ */
+const SHIPPED_BUILTIN_RULES: ReadonlyArray<ShippedRule> = [
+  { pattern: "\\bDROP\\s+TABLE\\b", message: "SQL DROP TABLE", prose: true },
+  { pattern: "\\bDROP\\s+DATABASE\\b", message: "SQL DROP DATABASE", prose: true },
+  { pattern: "\\bTRUNCATE\\s+TABLE\\b", message: "SQL TRUNCATE TABLE", prose: true },
+  { pattern: "\\bmkfs\\.[a-z0-9]+\\b", message: "Filesystem format", prose: true },
   {
     pattern: "\\b(curl|wget)\\b[^\\n]*\\|[^\\n]*\\b(sh|bash|zsh)\\b",
     message: "Piping a downloaded script straight into a shell",
+    prose: false,
   },
-  { pattern: ":\\(\\)\\s*\\{\\s*:\\|:&\\s*\\};:", message: "Fork bomb" },
+  { pattern: ":\\(\\)\\s*\\{\\s*:\\|:&\\s*\\};:", message: "Fork bomb", prose: false },
+
+  // ── Incident pack ──────────────────────────────────────────────────────
+  // DELETE FROM <table> followed directly by the end of the statement (`;`,
+  // a closing quote, end of command) or RETURNING. A WHERE, USING, LIMIT or
+  // alias in between means no match.
+  {
+    pattern: String.raw`\bDELETE\s+FROM\s+(?:ONLY\s+)?${SQL_IDENT}(?:\.${SQL_IDENT})*(?:\s*(?:[;'"\x60]|$)|\s+RETURNING\b)`,
+    message: "Unscoped SQL DELETE (no WHERE clause)",
+    prose: true,
+  },
+  {
+    pattern: String.raw`\b(?:terraform|tofu)\b(?:\s+-\S+)*\s+(?:destroy|apply\b${SEG}\s-destroy)\b`,
+    message: "terraform destroy (tears down managed infrastructure)",
+    prose: true,
+  },
+  {
+    pattern: String.raw`\bpulumi\b(?:\s+-\S+)*\s+(?:destroy|down)\b`,
+    message: "pulumi destroy (tears down a stack's infrastructure)",
+    prose: true,
+  },
+  // A GraphQL delete/destroy mutation sent by curl, wget, HTTPie or xh,
+  // unless it provably stays on this machine: denied when any non-loopback
+  // http(s) URL appears, or when no loopback host appears at all (a bare
+  // hostname or $API_URL may be production). Agents testing their own API
+  // on localhost stay allowed.
+  {
+    pattern:
+      String.raw`^(?=[\s\S]*(?:^|[\s;&|(/])(?:curl|wget|https?|xh)\s)` +
+      String.raw`(?=[\s\S]*\bmutation\b[\s\S]*?(?:delete|destroy)\w*\s*\()` +
+      String.raw`(?:(?=[\s\S]*\bhttps?://(?!${LOOPBACK}))|(?![\s\S]*(?:^|[^\w.-])${LOOPBACK}))`,
+    message: "GraphQL delete mutation sent to a remote API",
+    prose: true,
+  },
+  {
+    pattern: String.raw`\brailway\s+volumes?\s+(?:delete|remove|rm)\b`,
+    message: "Railway volume delete",
+    prose: true,
+  },
+  {
+    pattern: String.raw`\baws[ \t]+${TOKENS}s3[ \t]+rm\b${SEG}\s--recursive\b`,
+    message: "Recursive S3 delete",
+    prose: true,
+  },
+  {
+    pattern: String.raw`\baws[ \t]+${TOKENS}s3[ \t]+rb\b${SEG}\s--force\b`,
+    message: "S3 bucket force-remove (deletes every object)",
+    prose: true,
+  },
+  {
+    pattern: String.raw`\baws[ \t]+${TOKENS}rds[ \t]+delete-db-(?:instance|cluster)\b`,
+    message: "RDS database delete",
+    prose: true,
+  },
+  {
+    pattern: String.raw`\bkubectl[ \t]+${TOKENS}delete[ \t]+(?:namespaces?|ns)\b`,
+    message: "Kubernetes namespace delete",
+    prose: true,
+  },
+  {
+    pattern: String.raw`^(?=[\s\S]*\b(?:redis|valkey|keydb)-cli\b)[\s\S]*\bflush(?:all|db)\b`,
+    message: "Redis FLUSHALL/FLUSHDB (deletes every key)",
+    prose: true,
+  },
+  {
+    pattern: String.raw`\bdropDatabase\s*\(`,
+    message: "MongoDB dropDatabase()",
+    prose: true,
+  },
+  {
+    pattern: String.raw`\bsupabase[ \t]+${TOKENS}db[ \t]+reset\b${SEG}\s--(?:linked|db-url)\b`,
+    message: "Supabase reset of a remote database",
+    prose: true,
+  },
+  {
+    pattern: String.raw`\bgh\s+repo\s+delete\b`,
+    message: "GitHub repository delete",
+    prose: true,
+  },
+  {
+    pattern: String.raw`\bheroku\s+pg:reset\b`,
+    message: "Heroku Postgres reset",
+    prose: true,
+  },
+  {
+    pattern: String.raw`\b(?:fly|flyctl)\s+vol(?:umes?)?\s+(?:destroy|delete|rm)\b`,
+    message: "Fly.io volume destroy",
+    prose: true,
+  },
+  {
+    pattern: String.raw`\bgcloud\s+(?:(?:alpha|beta)\s+)?sql\s+instances\s+delete\b`,
+    message: "Cloud SQL instance delete",
+    prose: true,
+  },
+  // A recursive delete aimed at a bare Windows drive root (`d:\`, `D:/`): the
+  // whole volume, past the recycle bin. Only the root matches — a folder on the
+  // drive (`d:\cache`) is ordinary cleanup. cmd's switches can sit before or
+  // after the target, so /s and the root are each checked anywhere in the
+  // command.
+  {
+    pattern: String.raw`\b(?:rmdir|rd)\b(?=${SEG}/s\b)(?=${SEG}[ \t]${DRIVE_ROOT})`,
+    message: "Recursive delete of a Windows drive root (rmdir/rd /s)",
+    prose: true,
+  },
+  {
+    pattern: String.raw`\bRemove-Item\b(?=${SEG}[ \t]-r(?:ec\w*)?\b)(?=${SEG}[ \t]${DRIVE_ROOT})`,
+    message: "Recursive delete of a Windows drive root (Remove-Item -Recurse)",
+    prose: true,
+  },
 ];
+
+/**
+ * `bulkhead init --preset strict` rules. Each one is destructive but also
+ * routine in ordinary development (usually aimed at a throwaway local
+ * database, or a working tree a human is watching), so the default preset
+ * allows them. Strict is for unattended runs, where nobody is watching when
+ * the agent decides to start over. They are written into the user's
+ * bulkhead.yaml rather than built in, so a team can delete any line it
+ * disagrees with.
+ */
+const SHIPPED_STRICT_RULES: ReadonlyArray<ShippedRule> = [
+  {
+    pattern: String.raw`\bgit[ \t]+${TOKENS}reset[ \t]+${TOKENS}--hard\b`,
+    message: "git reset --hard (discards uncommitted work)",
+    prose: true,
+  },
+  // Any forced clean, not only -x: untracked files are uncommitted work too,
+  // and -x/-X also deletes ignored files such as .env. Dry runs (-n) pass.
+  {
+    pattern:
+      String.raw`\bgit[ \t]+${TOKENS}clean\b(?=${SEG}\s(?:-[a-z]*f|--force\b))` +
+      String.raw`(?!${SEG}\s(?:-[a-z]*n|--dry-run\b))`,
+    message: "git clean -f (deletes untracked files)",
+    prose: true,
+  },
+  // Every hard force-push, to any branch: --force, -f (alone or combined, as
+  // in -uf) or a +refspec. --force-with-lease and --force-if-includes pass.
+  {
+    pattern: String.raw`\bgit[ \t]+${TOKENS}push\b${SEG}\s(?:--force(?![-\w])|-[a-z]*f[a-z]*\b|\+[^\s;&|])`,
+    message: "Force-push without --force-with-lease",
+    prose: true,
+  },
+  {
+    pattern: String.raw`\bdrizzle-kit\s+push(?::\w+)?\b${SEG}\s--force\b`,
+    message: "drizzle-kit push --force (skips data-loss prompts)",
+    prose: true,
+  },
+  {
+    pattern: String.raw`\bprisma\s+migrate\s+reset\b`,
+    message: "prisma migrate reset (drops the database)",
+    prose: true,
+  },
+  {
+    pattern: String.raw`\bprisma\s+db\s+push\b${SEG}\s--(?:force-reset|accept-data-loss)\b`,
+    message: "prisma db push with data loss accepted",
+    prose: true,
+  },
+  {
+    pattern: String.raw`\bdocker\s+(?:volume\s+(?:rm|remove|prune)|system\s+prune\b${SEG}\s--volumes)\b`,
+    message: "Docker volume delete",
+    prose: true,
+  },
+  {
+    pattern: String.raw`\bdocker(?:-compose|[ \t]+compose)[ \t]+${TOKENS}down\b${SEG}\s(?:-v|--volumes)\b`,
+    message: "docker compose down -v (deletes volumes)",
+    prose: true,
+  },
+  {
+    pattern: String.raw`\b(?:rails|rake)[ \t]+${TOKENS}db:(?:drop|reset|purge|migrate:reset)\b`,
+    message: "Rails database drop/reset",
+    prose: true,
+  },
+  {
+    pattern: String.raw`\bartisan\s+(?:migrate:(?:fresh|reset|refresh)|db:wipe)\b`,
+    message: "Laravel database wipe",
+    prose: true,
+  },
+  {
+    pattern: String.raw`\b(?:manage\.py|django-admin)\s+(?:flush|reset_db)\b`,
+    message: "Django database flush",
+    prose: true,
+  },
+];
+
+function plainRule({ pattern, message }: ShippedRule): BlockedCommandRule {
+  return { pattern, message };
+}
+
+/** Always-on command rules; `normalizePolicy` merges them under any YAML. */
+export const BUILTIN_BLOCKED_COMMANDS: ReadonlyArray<BlockedCommandRule> =
+  SHIPPED_BUILTIN_RULES.map(plainRule);
+
+/** Extra rules written into bulkhead.yaml by `bulkhead init --preset strict`. */
+export const STRICT_PRESET_BLOCKED_COMMANDS: ReadonlyArray<BlockedCommandRule> =
+  SHIPPED_STRICT_RULES.map(plainRule);
+
+/**
+ * Exact pattern strings of the shipped content rules that may be skipped for
+ * a provably inert (text-only) command. See guards/blocked-commands.ts.
+ */
+export const PROSE_SENSITIVE_PATTERNS: ReadonlySet<string> = new Set(
+  [...SHIPPED_BUILTIN_RULES, ...SHIPPED_STRICT_RULES]
+    .filter((rule) => rule.prose)
+    .map((rule) => rule.pattern),
+);
 
 /**
  * Conservative defaults. False positives get a tool ripped out within a week,
@@ -151,7 +419,7 @@ export function defaultPolicy(workspaceRoot: string): Policy {
     workspaceRoot,
     protectedPaths: {
       deny: [...BUILTIN_PROTECTED_PATHS],
-      allow: [],
+      allow: [...DEFAULT_ALLOWED_PATHS],
     },
     // Note: dangerous force-push is handled by a built-in structured check
     // (order-independent, branch-precise) — not by a regex here.

@@ -1,4 +1,5 @@
 import { describe, it, expect } from "vitest";
+import { mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { sessionCostFromTranscript, rollupDailySpend, readDailySpend, localDateString } from "../src/cost.js";
 import { tempRepo, writeTranscript } from "./helpers.js";
@@ -23,6 +24,25 @@ describe("sessionCostFromTranscript", () => {
     const r = sessionCostFromTranscript(t);
     expect(r.unpricedModels).toContain("mystery-model");
     expect(r.totalUsd).toBeGreaterThan(0);
+  });
+
+  it("adds the session's subagent transcripts (<session>/subagents/*.jsonl)", () => {
+    const repo = tempRepo();
+    const t = join(repo, "sess-1.jsonl");
+    writeTranscript(t, [{ id: "main_1", model: "claude-opus-4-8", usage: { input_tokens: 1_000_000 } }]); // $5
+    mkdirSync(join(repo, "sess-1", "subagents"), { recursive: true });
+    writeTranscript(join(repo, "sess-1", "subagents", "agent-a1.jsonl"), [
+      { id: "sub_1", model: "claude-opus-4-8", usage: { output_tokens: 1_000_000 } }, // $25
+    ]);
+    writeTranscript(join(repo, "sess-1", "subagents", "agent-a1.meta.json"), [
+      { id: "ignored", model: "claude-opus-4-8", usage: { output_tokens: 1_000_000 } },
+    ]);
+    // Another session's subagents are not ours.
+    mkdirSync(join(repo, "sess-2", "subagents"), { recursive: true });
+    writeTranscript(join(repo, "sess-2", "subagents", "agent-b1.jsonl"), [
+      { id: "other_1", model: "claude-opus-4-8", usage: { output_tokens: 1_000_000 } },
+    ]);
+    expect(sessionCostFromTranscript(t).totalUsd).toBeCloseTo(30, 4);
   });
 
   it("returns zero for a missing transcript", () => {

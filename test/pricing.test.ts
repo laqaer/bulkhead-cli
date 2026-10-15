@@ -48,3 +48,33 @@ describe("priceFor", () => {
     expect(price.inputPerMTok).toBe(2);
   });
 });
+
+describe("current models (September 2026)", () => {
+  it("prices Opus 5.5 at $4/$20 with $0.20 cache reads", () => {
+    const { price, known } = priceFor("claude-opus-5-5");
+    expect(known).toBe(true);
+    expect(usageCost({ input_tokens: 1_000_000, output_tokens: 1_000_000 }, price)).toBeCloseTo(24, 6);
+    expect(usageCost({ cache_read_input_tokens: 1_000_000 }, price)).toBeCloseTo(0.2, 6);
+  });
+
+  it("prices Fable 5.1 cache reads at $0.25, not 0.1x input", () => {
+    const { price } = priceFor("claude-fable-5-1");
+    expect(usageCost({ cache_read_input_tokens: 1_000_000 }, price)).toBeCloseTo(0.25, 6);
+  });
+
+  it("prices Sonnet 5 at $2/$10", () => {
+    const { price } = priceFor("claude-sonnet-5");
+    expect(usageCost({ input_tokens: 1_000_000, output_tokens: 1_000_000 }, price)).toBeCloseTo(12, 6);
+  });
+
+  it("resolves a date-suffixed id to the LONGEST matching prefix", () => {
+    expect(priceFor("claude-opus-5-5-20260901").price).toEqual(DEFAULT_PRICING["claude-opus-5-5"]);
+    expect(priceFor("claude-opus-5-20260401").price).toEqual(DEFAULT_PRICING["claude-opus-5"]);
+    expect(priceFor("claude-fable-5-1-20260801").price).toEqual(DEFAULT_PRICING["claude-fable-5-1"]);
+  });
+
+  it("keeps the 0.1x default for models without a cache-read override", () => {
+    const { price } = priceFor("claude-opus-4-8");
+    expect(usageCost({ cache_read_input_tokens: 1_000_000 }, price)).toBeCloseTo(0.5, 6);
+  });
+});

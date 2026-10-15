@@ -22,12 +22,19 @@ import { formatRefusal, formatAsk } from "./refusal.js";
 import { classifyEvidence } from "./evidence.js";
 import { assessStop, sessionEvidence } from "./verify.js";
 import { assessRisk } from "./risk.js";
+import { preToolUseNotice, stopNotice, stopStateDirNotice } from "./describe.js";
 
 /**
  * The shape Claude Code reads back from a PreToolUse hook. We only ever emit a
  * decision when we intervene; on "allow" we return an empty object and let the
  * host's normal permission flow proceed (emitting "allow" would force-approve
  * the call and defeat the user's own settings).
+ *
+ * A deny's `permissionDecisionReason` is shown to Claude, not the user, so a
+ * block would otherwise be invisible to the person running the session.
+ * `systemMessage` is the hooks API's universal "warning message shown to the
+ * user"; a deny carries one redacted line naming what was blocked, why, and
+ * the ledger entry to look up.
  */
 export interface PreToolUseOutput {
   hookSpecificOutput?: {
@@ -35,6 +42,8 @@ export interface PreToolUseOutput {
     permissionDecision: "allow" | "deny" | "ask";
     permissionDecisionReason: string;
   };
+  /** One line for the human (deny only). */
+  systemMessage?: string;
   suppressOutput?: boolean;
 }
 
@@ -43,6 +52,8 @@ export interface HookResult {
   output: unknown;
   /** Process exit code. */
   exitCode: number;
+  /** Seq of the ledger entry this invocation appended, when it appended one. */
+  ledgerSeq?: number;
 }
 
 /**
@@ -67,12 +78,54 @@ export function handlePreToolUse(input: HookInput, now: Date = new Date()): Hook
       rule: err.fsCode,
       reason: err.message,
     };
-    return renderDecision({
-      action: "deny",
-      verdicts: [verdict],
-      deciding: verdict,
-      reason: err.message,
-    });
+    // Nothing reached the ledger (the substrate is what failed), so the
+    // notice carries no entry number.
+    return renderDecision(
+      {
+        action: "deny",
+        verdicts: [verdict],
+        deciding: verdict,
+        reason: err.message,
+      },
+      {
+        systemMessage: safeNotice(
+          () =>
+            preToolUseNotice({
+              ...verdict,
+              toolName: typeof input.tool_name === "string" ? input.tool_name : undefined,
+              toolInput: input.tool_input,
+              repoRoot: safeRepoRoot(input),
+            }),
+          "🛡 Bulkhead blocked this action: its state storage (.bulkhead/) is unavailable",
+        ),
+      },
+    );
+  }
+}
+
+/**
+ * The human notice rides on a decision that is already made and recorded. It
+ * must never cost that decision: a throw here would escape to cli.ts's
+ * fail-open handler and turn a deny into an allow, so any failure falls back
+ * to a fixed line.
+ */
+function safeNotice(build: () => string, fallback: string): string {
+  try {
+    return build();
+  } catch {
+    return fallback;
+  }
+}
+
+function ledgerRef(seq: number | undefined): string {
+  return seq === undefined ? "" : ` (ledger #${seq})`;
+}
+
+function safeRepoRoot(input: HookInput): string | undefined {
+  try {
+    return findRepoRoot(typeof input.cwd === "string" ? input.cwd : process.cwd());
+  } catch {
+    return undefined;
   }
 }
 
@@ -127,7 +180,7 @@ function preToolUseVerdict(input: HookInput, now: Date): HookResult {
   const decision = evaluate(call, policy, cost, loopVerdict, risk);
 
   // Record every interception to the evidence ledger, decision included.
-  guardStateDir(bulkheadDir(repoRoot), () =>
+  const entry = guardStateDir(bulkheadDir(repoRoot), () =>
     appendLedger(repoRoot, {
       ts: now.toISOString(),
       sessionId,
@@ -144,7 +197,21 @@ function preToolUseVerdict(input: HookInput, now: Date): HookResult {
     }),
   );
 
-  return renderDecision(decision);
+  const systemMessage =
+    decision.action === "deny"
+      ? safeNotice(
+          () =>
+            preToolUseNotice({
+              ...decision.deciding,
+              toolName: call.toolName,
+              toolInput: call.toolInput,
+              repoRoot,
+              seq: entry.seq,
+            }),
+          `🛡 Bulkhead blocked this action${ledgerRef(entry.seq)}`,
+        )
+      : undefined;
+  return { ...renderDecision(decision, { systemMessage }), ledgerSeq: entry.seq };
 }
 
 /** PostToolUse: refresh spend, classify + record what the completed action proved. */
@@ -187,6 +254,8 @@ export function handlePostToolUse(input: HookInput, now: Date = new Date()): Hoo
 export interface StopOutput {
   decision?: "block";
   reason?: string;
+  /** One line for the human: the `reason` above is read by Claude only. */
+  systemMessage?: string;
   suppressOutput?: boolean;
 }
 
@@ -214,7 +283,14 @@ export function handleStop(input: HookInput, now: Date = new Date()): HookResult
     // failing closed here: the turn cannot end until a human restores access,
     // which is exactly what the reason string asks for.
     return {
-      output: { decision: "block", reason: err.message } satisfies StopOutput,
+      output: {
+        decision: "block",
+        reason: err.message,
+        systemMessage: safeNotice(
+          () => stopStateDirNotice(err.fsCode),
+          "🛡 Bulkhead: state storage .bulkhead/ unavailable — the session cannot finish until a human restores it",
+        ),
+      } satisfies StopOutput,
       exitCode: 0,
     };
   }
@@ -253,7 +329,7 @@ function stopVerdict(input: HookInput, now: Date): HookResult {
   const stopHookActive = input.stop_hook_active === true;
   const blocking = assessment.shouldBlock && !stopHookActive;
 
-  guardStateDir(bulkheadDir(repoRoot), () =>
+  const entry = guardStateDir(bulkheadDir(repoRoot), () =>
     appendLedger(repoRoot, {
       ts: now.toISOString(),
       sessionId,
@@ -275,18 +351,29 @@ function stopVerdict(input: HookInput, now: Date): HookResult {
 
   if (blocking) {
     return {
-      output: { decision: "block", reason: assessment.blockReason } satisfies StopOutput,
+      output: {
+        decision: "block",
+        reason: assessment.blockReason,
+        systemMessage: safeNotice(
+          () => stopNotice(assessment.verdicts, entry.seq),
+          `🛡 Bulkhead: completion check failed — sent back to work${ledgerRef(entry.seq)}`,
+        ),
+      } satisfies StopOutput,
       exitCode: 0,
+      ledgerSeq: entry.seq,
     };
   }
-  return { output: { suppressOutput: true }, exitCode: 0 };
+  return { output: { suppressOutput: true }, exitCode: 0, ledgerSeq: entry.seq };
 }
 
 function firstString(v: unknown): string | undefined {
   return typeof v === "string" && v.length > 0 ? v : undefined;
 }
 
-export function renderDecision(decision: Decision): HookResult {
+export function renderDecision(
+  decision: Decision,
+  extras: { systemMessage?: string } = {},
+): HookResult {
   if (decision.action === "deny") {
     return {
       output: {
@@ -297,6 +384,7 @@ export function renderDecision(decision: Decision): HookResult {
             decision.deciding ?? { action: "deny", guard: "bulkhead", reason: decision.reason },
           ),
         },
+        ...(extras.systemMessage ? { systemMessage: extras.systemMessage } : {}),
       } satisfies PreToolUseOutput,
       exitCode: 0,
     };

@@ -1,20 +1,27 @@
 import type { ModelPrice, Usage } from "./types.js";
 
 /**
- * Per-1M-token list prices (USD), current as of July 2026.
+ * Per-1M-token list prices (USD), current as of September 2026.
  * Source: Anthropic model pricing. Kept deliberately small — this is used only
  * to turn transcript token counts into a dollar estimate for the budget guard,
  * not to bill anyone. Users can override or extend via `budget.pricing` in
  * bulkhead.yaml for models not listed here.
+ *
+ * Lookup is exact first, then the LONGEST matching prefix (for date-suffixed
+ * ids), so `claude-opus-5-5-…` can never resolve to `claude-opus-5`.
  */
 export const DEFAULT_PRICING: Record<string, ModelPrice> = {
+  "claude-fable-5-1": { inputPerMTok: 10, outputPerMTok: 50, cacheReadPerMTok: 0.25 },
   "claude-fable-5": { inputPerMTok: 10, outputPerMTok: 50 },
+  "claude-mythos-5-1": { inputPerMTok: 10, outputPerMTok: 50 },
   "claude-mythos-5": { inputPerMTok: 10, outputPerMTok: 50 },
+  "claude-opus-5-5": { inputPerMTok: 4, outputPerMTok: 20, cacheReadPerMTok: 0.2 },
+  "claude-opus-5": { inputPerMTok: 5, outputPerMTok: 25 },
   "claude-opus-4-8": { inputPerMTok: 5, outputPerMTok: 25 },
   "claude-opus-4-7": { inputPerMTok: 5, outputPerMTok: 25 },
   "claude-opus-4-6": { inputPerMTok: 5, outputPerMTok: 25 },
   "claude-opus-4-5": { inputPerMTok: 5, outputPerMTok: 25 },
-  "claude-sonnet-5": { inputPerMTok: 3, outputPerMTok: 15 },
+  "claude-sonnet-5": { inputPerMTok: 2, outputPerMTok: 10 },
   "claude-sonnet-4-6": { inputPerMTok: 3, outputPerMTok: 15 },
   "claude-sonnet-4-5": { inputPerMTok: 3, outputPerMTok: 15 },
   "claude-haiku-4-5": { inputPerMTok: 1, outputPerMTok: 5 },
@@ -51,6 +58,10 @@ export function usageCost(usage: Usage, price: ModelPrice): number {
 
   const inRate = price.inputPerMTok / PER_TOKEN;
   const outRate = price.outputPerMTok / PER_TOKEN;
+  const readRate =
+    price.cacheReadPerMTok !== undefined
+      ? price.cacheReadPerMTok / PER_TOKEN
+      : inRate * CACHE_READ_MULTIPLIER;
 
   const cacheWriteCost = cacheCreationCost(usage, inRate);
 
@@ -58,7 +69,7 @@ export function usageCost(usage: Usage, price: ModelPrice): number {
     input * inRate +
     output * outRate +
     cacheWriteCost +
-    cacheRead * inRate * CACHE_READ_MULTIPLIER
+    cacheRead * readRate
   );
 }
 
@@ -82,8 +93,11 @@ export function priceFor(
   const hit = merged[model];
   if (hit) return { price: hit, known: true };
   // Prefix match handles date-suffixed ids like claude-haiku-4-5-20251001.
+  // Longest prefix wins, so claude-opus-5-5-… never resolves to claude-opus-5.
+  let best: { id: string; price: ModelPrice } | undefined;
   for (const [id, price] of Object.entries(merged)) {
-    if (model.startsWith(id)) return { price, known: true };
+    if (model.startsWith(id) && (!best || id.length > best.id.length)) best = { id, price };
   }
+  if (best) return { price: best.price, known: true };
   return { price: FALLBACK_PRICE, known: false };
 }

@@ -1,5 +1,6 @@
 import type { Evidence, EvidenceType, LedgerEntry } from "./types.js";
 import type { Verdict } from "./verify.js";
+import { actionSummary, denialLabel } from "./describe.js";
 
 /**
  * Turn the raw ledger into the thing a human actually reads between incidents:
@@ -15,20 +16,35 @@ export interface PromptCost {
   denials: number;
 }
 
+export interface SessionDenial {
+  seq: number;
+  toolName?: string;
+  guard?: string;
+  rule?: string;
+  /** Human reason ("SQL DROP TABLE", "protected path (.env)"), never a regex. */
+  label: string;
+  /** What was attempted: the command or path, repo-relative, clipped. */
+  summary: string;
+}
+
 export interface SessionReport {
   sessionId: string;
   firstTs?: string;
   lastTs?: string;
   totalUsd: number;
   prompts: PromptCost[];
-  denials: Array<{ seq: number; toolName?: string; guard?: string; rule?: string }>;
+  denials: SessionDenial[];
   evidence: Partial<Record<EvidenceType, number>>;
   evidenceSamples: Evidence[];
   stopVerdicts: Verdict[];
   stopsBlocked: number;
 }
 
-export function buildSessionReport(entries: LedgerEntry[], sessionId: string): SessionReport {
+export function buildSessionReport(
+  entries: LedgerEntry[],
+  sessionId: string,
+  opts: { repoRoot?: string } = {},
+): SessionReport {
   const mine = entries.filter((e) => e.sessionId === sessionId);
 
   // Per-prompt cost: the session cost snapshot is monotonic (a deterministic
@@ -81,7 +97,14 @@ export function buildSessionReport(entries: LedgerEntry[], sessionId: string): S
     prompts: [...promptMap.values()].sort((a, b) => b.usd - a.usd),
     denials: mine
       .filter((e) => e.event === "pre" && e.action === "deny")
-      .map((e) => ({ seq: e.seq, toolName: e.toolName, guard: e.guard, rule: e.rule })),
+      .map((e) => ({
+        seq: e.seq,
+        toolName: e.toolName,
+        guard: e.guard,
+        rule: e.rule,
+        label: denialLabel(e),
+        summary: actionSummary(e.toolInput, { repoRoot: opts.repoRoot, mode: "paths", max: 80 }),
+      })),
     evidence: evidenceCounts,
     evidenceSamples,
     stopVerdicts,
@@ -110,7 +133,8 @@ export function renderSessionReport(r: SessionReport): string {
   if (r.denials.length > 0) {
     lines.push(`  Denied: ${r.denials.length}`);
     for (const d of r.denials.slice(-5)) {
-      lines.push(`    ⛔ #${d.seq} ${d.toolName ?? ""} [${d.guard}] ${d.rule ?? ""}`);
+      const tool = d.toolName ? `${d.toolName} · ` : "";
+      lines.push(`    ⛔ #${d.seq} ${tool}${d.label} (${d.guard ?? "bulkhead"})`);
     }
   }
   const evParts = Object.entries(r.evidence).map(([t, n]) => `${t}×${n}`);

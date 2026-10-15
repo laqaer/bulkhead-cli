@@ -25,3 +25,8 @@ export { protectedPathsGuard } from "./guards/protected-paths.js";
 export { blockedCommandsGuard } from "./guards/blocked-commands.js";
 export { budgetGuard } from "./guards/budget.js";
 export { loopCheck, signatureFor, emptyLoopState } from "./guards/loop.js";
+export * from "./redact.js";
+export * from "./describe.js";
+export * from "./receipt.js";
+export { runDemo, renderDemo, summaryLine, DEMO_PRESETS } from "./demo.js";
+export type { DemoResult, DemoCaseResult, DemoStory, DemoGroup, DemoActual } from "./demo.js";

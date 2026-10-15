@@ -67,6 +67,11 @@ export interface Decision {
 export interface ModelPrice {
   inputPerMTok: number;
   outputPerMTok: number;
+  /**
+   * Cache-read rate per 1M tokens, for models whose cache reads are not the
+   * standard 0.1x of input. Omitted means 0.1x input.
+   */
+  cacheReadPerMTok?: number;
 }
 
 /** Token usage as reported in a Claude Code transcript assistant message. */

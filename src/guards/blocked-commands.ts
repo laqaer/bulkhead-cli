@@ -1,7 +1,14 @@
-import { relative, resolve } from "node:path";
+import { existsSync, realpathSync } from "node:fs";
+import { homedir, tmpdir } from "node:os";
+import { isAbsolute, join, relative, resolve } from "node:path";
 import type { GuardVerdict, ToolCall } from "../types.js";
-import type { Policy } from "../policy.js";
-import { commandString, rmTargets, gitPushInvocations } from "../extract.js";
+import { PROSE_SENSITIVE_PATTERNS, type Policy } from "../policy.js";
+import {
+  commandString,
+  expandHomePrefix,
+  rmTargets,
+  gitPushInvocations,
+} from "../extract.js";
 
 const GUARD = "blocked-commands";
 
@@ -29,6 +36,27 @@ const INERT_TEXT_COMMANDS = new Set([
 ]);
 
 /**
+ * Commands whose quoted arguments are a *message* for humans — a commit
+ * message, a PR or issue body — and never code the command runs. An agent
+ * that writes "fix: delete from cart" or "remove the terraform destroy step"
+ * into a commit is describing work, and denying it is exactly the kind of
+ * false positive that gets a guardrail uninstalled.
+ *
+ * Matched on exact leading tokens (`git commit`, `gh pr|issue
+ * create|edit|comment`), never a path or a wrapper, and still subject to the
+ * whole-command rule below: `git commit -m x && psql -c "DELETE FROM users;"`
+ * is not inert, and `$(...)` inside the message disqualifies it in the scanner.
+ */
+function isMessageCommand(tokens: string[]): boolean {
+  if (tokens[0] === "git" && tokens[1] === "commit") return true;
+  return (
+    tokens[0] === "gh" &&
+    (tokens[1] === "pr" || tokens[1] === "issue") &&
+    (tokens[2] === "create" || tokens[2] === "edit" || tokens[2] === "comment")
+  );
+}
+
+/**
  * Flags that hand an allowlisted command something to execute. `rg --pre` is
  * the sharp one: ripgrep is a pure text tool right up until you give it a
  * preprocessor binary to run over every file it reads.
@@ -39,30 +67,29 @@ const EXEC_FLAGS = new Set([
 ]);
 
 /**
- * The built-in patterns that describe destructive *content* — the ones that
- * fire on text merely quoting a statement, which is the whole of issue #2.
- * Only these may be skipped, and only for a provably inert command.
+ * The shipped patterns that describe destructive *content* — the ones that
+ * fire on text merely quoting a statement, which is the whole of issue #2
+ * (`grep -rn "terraform destroy" docs/` is reading, not destroying). Only
+ * these may be skipped, and only for a provably inert command. The set is
+ * built in policy.ts from the rules marked `prose`: the four original SQL and
+ * mkfs rules, the incident pack, and the strict preset. `curl | sh` and the
+ * fork bomb are not in it.
  *
- * This is exact built-in *pattern* semantics, not provenance. `bulkhead init`
+ * This is exact shipped *pattern* semantics, not provenance. `bulkhead init`
  * writes these very patterns into the user's bulkhead.yaml (see templates.ts),
- * so a flag set in defaultPolicy() would miss every real install — matching on
- * the pattern string is what makes the fix reach actual installs at all.
+ * and the strict preset exists ONLY there, so a flag set in defaultPolicy()
+ * would miss every real install — matching on the pattern string is what makes
+ * the exception reach actual installs at all.
  *
  * Known limit, stated plainly: string equality cannot tell a stock rule from
  * an identical regex a customer wrote themselves, so an operator who
- * independently authors one of these four patterns gets the exception too.
+ * independently authors one of these exact patterns gets the exception too.
  * What it does buy is narrower and still worth having — a rule whose pattern
- * differs from all four, such as banning `echo` or a secret-file read, is
- * never skipped, however inert the command looks. Distinguishing true
- * provenance needs the policy loader to tag rules at parse time; that is a
- * larger change than this fix, and worth doing if this set ever grows.
+ * differs from every shipped one, such as banning `echo` or a secret-file
+ * read, is never skipped, however inert the command looks. Distinguishing true
+ * provenance needs the policy loader to tag rules at parse time.
  */
-const PROSE_SENSITIVE_DEFAULTS = new Set([
-  "\\bDROP\\s+TABLE\\b",
-  "\\bDROP\\s+DATABASE\\b",
-  "\\bTRUNCATE\\s+TABLE\\b",
-  "\\bmkfs\\.[a-z0-9]+\\b",
-]);
+const PROSE_SENSITIVE_DEFAULTS = PROSE_SENSITIVE_PATTERNS;
 
 /**
  * Split a command into segments of tokens, tracking quote state, or return
@@ -199,6 +226,7 @@ function isInertTextOnly(cmd: string): boolean {
     // script that can do anything, and matching on the basename would let it
     // inherit the allowlist. Wrappers are not skipped past either: `sudo`,
     // `env`, `command` and `sh -c` are simply not inert.
+    if (isMessageCommand(tokens)) continue;
     if (!INERT_TEXT_COMMANDS.has(exe)) return false;
 
     for (const token of tokens.slice(1)) {
@@ -257,22 +285,84 @@ export function blockedCommandsGuard(call: ToolCall, policy: Policy): GuardVerdi
   return { action: "allow", guard: GUARD };
 }
 
+/** The whole home directory, however it is spelled: `~`, `~/`, `$HOME`, `${HOME}/`. */
+const WHOLE_HOME = /^(?:~|\$HOME|\$\{HOME\})\/*$/;
+
 function rmOutsideWorkspace(cmd: string, workspaceRoot: string): GuardVerdict | null {
   const targets = rmTargets(cmd);
   if (!targets || targets.length === 0) return null;
   const root = resolve(workspaceRoot);
   for (const t of targets) {
     // Absolute-path root deletes and obvious escapes.
-    if (t === "/" || t === "/*" || t === "~" || t === "~/" || t.startsWith("/*")) {
+    if (t === "/" || t === "/*" || t.startsWith("/*")) {
       return deny(t, "targets a filesystem root");
     }
-    const abs = resolve(root, t);
+    if (WHOLE_HOME.test(t)) return deny(t, "targets the home directory");
+    // Expand ~, $HOME and ${HOME} to the real home directory FIRST, then apply
+    // the ordinary inside-the-workspace test: `rm -rf ~/backups` is outside,
+    // while `rm -rf ~/code/thisrepo/dist` is still an in-repo cleanup when the
+    // repo lives at ~/code/thisrepo.
+    const expanded = expandHomePrefix(t);
+    if (expanded === null) {
+      return deny(t, "names a home directory Bulkhead cannot resolve");
+    }
+    const abs = resolve(root, expanded);
     const rel = relative(root, abs);
     if (rel === "" || rel.startsWith("..")) {
+      if (rel !== "" && isRegenerableScratch(t, abs, root)) continue;
       return deny(t, "resolves outside the workspace");
     }
   }
   return null;
+}
+
+/**
+ * Outside the workspace, but safe to clear: temp directories and the caches
+ * tools rebuild on demand (`rm -rf ~/.npm/_npx`, `~/.cache/pip`,
+ * `/tmp/build-cache`). Denying those taught people to switch the guard off.
+ *
+ * Strictly inside a scratch root (the root itself only for npm's two named
+ * caches), no glob characters, and the real location — through symlinks —
+ * must be inside a scratch root too, so `/tmp/link -> ~/work` stays denied.
+ */
+function isRegenerableScratch(target: string, abs: string, root: string): boolean {
+  if (/[*?[\]]/.test(target)) return false;
+  // Never the workspace or anything that contains it, wherever it lives.
+  const toRoot = relative(abs, root);
+  if (toRoot === "" || (!toRoot.startsWith("..") && !isAbsolute(toRoot))) return false;
+  let home: string | null;
+  try {
+    home = homedir() || null;
+  } catch {
+    home = null; // no home: only the temp roots qualify
+  }
+  const inside: string[] = ["/tmp", "/var/tmp", tmpdir()];
+  const itself: string[] = [];
+  if (home) {
+    inside.push(join(home, ".cache"), join(home, "Library", "Caches"));
+    itself.push(join(home, ".npm", "_npx"), join(home, ".npm", "_cacache"));
+  }
+  const real = (p: string) => {
+    try {
+      return existsSync(p) ? realpathSync(p) : p;
+    } catch {
+      return p;
+    }
+  };
+  const within = (p: string, dir: string, allowSelf: boolean) => {
+    const r = relative(dir, p);
+    return (allowSelf || r !== "") && !r.startsWith("..") && !isAbsolute(r);
+  };
+  const caches = (p: string) =>
+    (home !== null && [join(home, ".cache"), join(home, "Library", "Caches")].some((d) => within(p, d, false))) ||
+    itself.some((d) => within(p, d, true) || within(p, real(d), true));
+  const ok = (p: string) => {
+    // Under the home directory only the named caches count, even when home
+    // itself sits under a temp root.
+    if (home !== null && within(p, home, true)) return caches(p);
+    return caches(p) || inside.some((d) => within(p, d, false) || within(p, real(d), false));
+  };
+  return ok(abs) && ok(real(abs));
 }
 
 function deny(target: string, why: string): GuardVerdict {
@@ -294,12 +384,19 @@ function deny(target: string, why: string): GuardVerdict {
  * whatever branch is tracked — could be main). `--force-with-lease` and
  * `--force-if-includes` are the safe variants and are never treated as a hard
  * force.
+ *
+ * A `+` in front of a refspec forces that one ref with no flag at all, so
+ * `git push origin +main` (or `+HEAD:main`) is a force-push to main too. It is
+ * denied even alongside --force-with-lease: a `+` refspec's per-ref force
+ * carries that ref past a stale-lease rejection, so the lease protects nothing.
  */
 function forcePush(cmd: string): GuardVerdict | null {
   for (const { flags, positionals } of gitPushInvocations(cmd)) {
-    if (!flags.some(isHardForceFlag)) continue;
     const refs = positionals.filter((p) => !p.includes("://")); // drop URL remotes
-    if (refs.some(isProtectedRef)) {
+    const plusToProtected = refs.some((r) => r.startsWith("+") && isProtectedRef(r));
+    const hardForce = flags.some(isHardForceFlag);
+    if (!hardForce && !plusToProtected) continue;
+    if (plusToProtected || refs.some(isProtectedRef)) {
       return {
         action: "deny",
         guard: GUARD,

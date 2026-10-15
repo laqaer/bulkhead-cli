@@ -1,7 +1,15 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { bulkheadDir, policyPath } from "./paths.js";
-import { DEFAULT_POLICY_YAML, GITIGNORE_LINE } from "./templates.js";
+import {
+  GITIGNORE_LINE,
+  POLICY_PRESETS,
+  isPolicyPreset,
+  policyTemplate,
+  type PolicyPreset,
+} from "./templates.js";
+
+export { POLICY_PRESETS, isPolicyPreset, type PolicyPreset };
 
 /** Tools that can cause damage or that we want in the loop/budget accounting. */
 export const DEFAULT_PRE_MATCHER = "*";
@@ -16,10 +24,20 @@ export interface InitOptions {
   hookCommand?: string;
   /** Overwrite an existing bulkhead.yaml. Default: keep the user's file. */
   force?: boolean;
+  /**
+   * Which policy file to write: `default` (conservative) or `strict` (adds
+   * rules for routine-but-destructive commands, for unattended runs). Only
+   * takes effect when the policy file is written — an existing bulkhead.yaml
+   * is kept unless `force` is set, preset or not.
+   */
+  preset?: PolicyPreset;
 }
 
 export interface InitResult {
   repoRoot: string;
+  /** The preset requested (default when none was given). */
+  preset: PolicyPreset;
+  /** True when bulkhead.yaml was written from `preset`'s template. */
   policyCreated: boolean;
   settingsPath: string;
   settingsUpdated: boolean;
@@ -56,12 +74,21 @@ function isLegacyBulkheadCommand(command: unknown): boolean {
 
 export function runInit(repoRoot: string, opts: InitOptions = {}): InitResult {
   const base = opts.hookCommand ?? "npx --yes @bulkheadtools/cli hook";
+  const preset: unknown = opts.preset ?? "default";
+  // Validate before touching the disk: an unknown preset must never fall
+  // back to writing some other policy the caller did not ask for.
+  if (!isPolicyPreset(preset)) {
+    throw new Error(
+      `Unknown preset ${JSON.stringify(preset)}. Expected one of: ${POLICY_PRESETS.join(", ")}.`,
+    );
+  }
 
-  // 1. Policy file.
+  // 1. Policy file. An existing one is the user's and is never replaced
+  // without `force` — including when a different preset was requested.
   const pPath = policyPath(repoRoot);
   let policyCreated = false;
   if (!existsSync(pPath) || opts.force) {
-    writeFileSync(pPath, DEFAULT_POLICY_YAML);
+    writeFileSync(pPath, policyTemplate(preset));
     policyCreated = true;
   }
 
@@ -79,11 +106,69 @@ export function runInit(repoRoot: string, opts: InitOptions = {}): InitResult {
 
   return {
     repoRoot,
+    preset,
     policyCreated,
     settingsPath,
     settingsUpdated,
     gitignoreUpdated,
   };
+}
+
+export interface UninstallResult {
+  repoRoot: string;
+  settingsPath: string;
+  /** Bulkhead hook commands removed from settings.json (0 when none were there). */
+  hooksRemoved: number;
+  /** Left in place on purpose: the user's policy and the evidence ledger. */
+  policyKept: boolean;
+  stateKept: boolean;
+}
+
+/**
+ * Remove Bulkhead's hooks from .claude/settings.json and nothing else. Every
+ * other hook, permission and setting is kept byte-for-byte in meaning; hook
+ * events left empty are dropped. bulkhead.yaml (the user's policy) and
+ * .bulkhead/ (the ledger — the evidence) stay: deleting evidence is the
+ * human's call, and the CLI says how.
+ */
+export function runUninstall(repoRoot: string): UninstallResult {
+  const settingsPath = join(repoRoot, ".claude", "settings.json");
+  const result: UninstallResult = {
+    repoRoot,
+    settingsPath,
+    hooksRemoved: 0,
+    policyKept: existsSync(policyPath(repoRoot)),
+    stateKept: existsSync(bulkheadDir(repoRoot)),
+  };
+  if (!existsSync(settingsPath)) return result;
+
+  let settings: Record<string, unknown>;
+  try {
+    settings = JSON.parse(readFileSync(settingsPath, "utf8")) as Record<string, unknown>;
+  } catch (err) {
+    throw new Error(
+      `${settingsPath} is not valid JSON (${String(err)}). Fix it, then re-run bulkhead uninstall — refusing to rewrite your settings.`,
+    );
+  }
+  if (!settings.hooks || typeof settings.hooks !== "object") return result;
+
+  const hooks = { ...(settings.hooks as Record<string, unknown>) };
+  let removed = 0;
+  for (const event of ["PreToolUse", "PostToolUse", "Stop"]) {
+    if (!Array.isArray(hooks[event])) continue;
+    const before = asMatcherArray(hooks[event]);
+    const after = stripBulkhead(before);
+    const count = (ms: HookMatcher[]) => ms.reduce((n, m) => n + (m.hooks ?? []).length, 0);
+    removed += count(before) - count(after);
+    if (after.length === 0) delete hooks[event];
+    else hooks[event] = after;
+  }
+  if (removed === 0) return result;
+
+  const next: Record<string, unknown> = { ...settings, hooks };
+  if (Object.keys(hooks).length === 0) delete next.hooks;
+  writeFileSync(settingsPath, JSON.stringify(next, null, 2) + "\n");
+  return { ...result, hooksRemoved: removed };
 }
 
 function ensureGitignore(repoRoot: string): boolean {
