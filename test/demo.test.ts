@@ -24,7 +24,7 @@ const PKG_VERSION = JSON.parse(readFileSync(resolve(HERE, "..", "package.json"),
 const ANSI = /\u001b\[/;
 
 function runCli(args: string[], opts: { cwd?: string; env?: Record<string, string | undefined> } = {}) {
-  const env = { ...process.env, NO_COLOR: undefined, FORCE_COLOR: undefined, ...opts.env };
+  const env = { ...process.env, TERM: "xterm", NO_COLOR: undefined, FORCE_COLOR: undefined, ...opts.env };
   for (const k of Object.keys(env)) if (env[k] === undefined) delete env[k];
   return spawnSync("node", [CLI, ...args], {
     cwd: opts.cwd ?? tempRepo(),
@@ -208,6 +208,7 @@ describe("bulkhead demo (real binary)", () => {
   it("colors only for a terminal or FORCE_COLOR, and NO_COLOR wins", () => {
     expect(runCli(["demo"], { env: { FORCE_COLOR: "1" } }).stdout).toMatch(ANSI);
     expect(runCli(["demo"], { env: { FORCE_COLOR: "1", NO_COLOR: "1" } }).stdout).not.toMatch(ANSI);
+    expect(runCli(["demo"], { env: { TERM: "dumb", FORCE_COLOR: "1" } }).stdout).not.toMatch(ANSI);
   });
 
   it("rejects an unknown preset with a usable message", () => {
