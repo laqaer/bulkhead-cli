@@ -1,0 +1,124 @@
+name: Documentation receipts
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - "docs/updates/**"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  record:
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Record default-branch revision
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPOSITORY: ${{ github.repository }}
+          GH_REVISION: ${{ github.sha }}
+          GH_BRANCH: ${{ github.ref_name }}
+        run: |
+          python3 - <<'PY'
+          import base64
+          import json
+          import os
+          import re
+          import time
+          import urllib.error
+          import urllib.request
+
+          repository = os.environ["GH_REPOSITORY"]
+          revision = os.environ["GH_REVISION"]
+          branch = os.environ["GH_BRANCH"]
+          token = os.environ["GH_TOKEN"]
+          api = f"https://api.github.com/repos/{repository}"
+          headers = {
+              "Authorization": f"Bearer {token}",
+              "Accept": "application/vnd.github+json",
+              "X-GitHub-Api-Version": "2022-11-28",
+              "User-Agent": "documentation-receipts",
+          }
+
+          def request(method, url, payload=None):
+              data = json.dumps(payload).encode() if payload is not None else None
+              req = urllib.request.Request(
+                  url, data=data, headers=headers, method=method
+              )
+              with urllib.request.urlopen(req, timeout=20) as response:
+                  return json.load(response)
+
+          commit = request("GET", f"{api}/commits/{revision}")
+          date = commit["commit"]["committer"]["date"][:10]
+          subject = commit["commit"]["message"].splitlines()[0][:180]
+          subject = re.sub(r"[\r\n|]", " ", subject).strip()
+          path = f"docs/updates/{date[:7]}/{date}-{revision[:12]}.md"
+          event = {}
+          try:
+              with open(os.environ["GITHUB_EVENT_PATH"], encoding="utf-8") as stream:
+                  event = json.load(stream)
+          except (OSError, ValueError):
+              pass
+          before = event.get("before") or ""
+          before_valid = bool(re.fullmatch(r"[0-9a-f]{40}", before)) and set(before) != {"0"}
+          compare = (
+              f"https://github.com/{repository}/compare/{before}...{revision}"
+              if before_valid else f"https://github.com/{repository}/commit/{revision}"
+          )
+          changed = commit.get("files", [])
+          lines = [
+              f"# Source receipt — {date} — {revision[:12]}",
+              "",
+              f"- **Repository:** `{repository}`",
+              f"- **Revision:** [`{revision}`](https://github.com/{repository}/commit/{revision})",
+              f"- **Default branch:** `{branch}`",
+              f"- **Commit subject:** {subject}",
+              f"- **Push comparison:** [View changes]({compare})",
+              f"- **Changed files in the head commit:** {len(changed)}",
+              "",
+              "## Head-commit paths",
+              "",
+          ]
+          lines += [
+              f"- `{item['filename'].replace(chr(96), '')}` ({item.get('status', 'changed')})"
+              for item in changed[:40]
+          ] or ["- No file list returned by GitHub."]
+          if len(changed) > 40:
+              lines.append(f"- …and {len(changed) - 40} more; see the commit.")
+          lines += [
+              "",
+              "**Evidence boundary:** This receipt records source history only.",
+              "It does not verify CI, production deployment, customer use, revenue, or safety.",
+              "Consult the owning issue, PR, release notes and monitoring evidence.",
+              "",
+          ]
+          content = "\n".join(lines)
+          payload = {
+              "message": f"docs: record source revision {revision[:12]} [skip ci]",
+              "content": base64.b64encode(content.encode()).decode(),
+              "branch": branch,
+          }
+          url = f"{api}/contents/{path}"
+          for attempt in range(5):
+              try:
+                  request("PUT", url, payload)
+                  print(f"Recorded {path}")
+                  break
+              except urllib.error.HTTPError as error:
+                  if error.code in (409, 422):
+                      try:
+                          request("GET", url)
+                          print(f"Receipt already exists: {path}")
+                          break
+                      except urllib.error.HTTPError as missing:
+                          if missing.code != 404:
+                              raise
+                      time.sleep(1 + attempt)
+                      continue
+                  raise
+          else:
+              raise RuntimeError("Receipt write failed after five attempts")
+          PY
