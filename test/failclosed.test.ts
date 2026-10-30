@@ -152,7 +152,6 @@ describe("state-dir error classification (F2 internals)", () => {
 
 describe("state-dir fail-closed (F2, in-process hook)", () => {
   it("positive control: protected write denies while enforcement is intact", () => {
-    if (skipOnRoot) return;
     const repo = initRepo();
     try {
       expect(denyDecision(handlePreToolUse(protectedWriteCall(repo)))).toBe("deny");
@@ -161,8 +160,7 @@ describe("state-dir fail-closed (F2, in-process hook)", () => {
     }
   });
 
-  it("denies a protected write when .bulkhead/ is unwritable (was silent ALLOW)", () => {
-    if (skipOnRoot) return;
+  it.skipIf(skipOnRoot)("denies a protected write when .bulkhead/ is unwritable (was silent ALLOW)", () => {
     const repo = initRepo();
     try {
       chmodSync(join(repo, ".bulkhead"), 0o000);
@@ -175,8 +173,7 @@ describe("state-dir fail-closed (F2, in-process hook)", () => {
     }
   });
 
-  it("state-dir denial points at restoring access, NOT at editing bulkhead.yaml", () => {
-    if (skipOnRoot) return;
+  it.skipIf(skipOnRoot)("state-dir denial points at restoring access, NOT at editing bulkhead.yaml", () => {
     const repo = initRepo();
     try {
       chmodSync(join(repo, ".bulkhead"), 0o000);
@@ -198,8 +195,7 @@ describe("state-dir fail-closed (F2, in-process hook)", () => {
     }
   });
 
-  it("enforcement returns after .bulkhead/ becomes writable again", () => {
-    if (skipOnRoot) return;
+  it.skipIf(skipOnRoot)("enforcement returns after .bulkhead/ becomes writable again", () => {
     const repo = initRepo();
     const call = () => denyDecision(handlePreToolUse(protectedWriteCall(repo)));
     try {
@@ -215,8 +211,7 @@ describe("state-dir fail-closed (F2, in-process hook)", () => {
 });
 
 describe("state-dir fail-closed (F2, real CLI process)", () => {
-  it("hook protocol denies, ledger stays dark during outage, resumes after", () => {
-    if (skipOnRoot) return;
+  it.skipIf(skipOnRoot)("hook protocol denies, ledger stays dark during outage, resumes after", () => {
     const repo = initRepo();
     const ledgerPath = join(repo, ".bulkhead", "ledger.jsonl");
     const ledgerLines = () =>
@@ -293,7 +288,6 @@ function falseStopClaim(repo: string, extra: Record<string, unknown> = {}): Para
 
 describe("state-dir fail-closed on Stop (F2b, in-process hook)", () => {
   it("positive control: a false completion claim blocks while .bulkhead/ is writable", () => {
-    if (skipOnRoot) return;
     const repo = initRepo();
     try {
       recordFailingTests(repo);
@@ -305,8 +299,7 @@ describe("state-dir fail-closed on Stop (F2b, in-process hook)", () => {
     }
   });
 
-  it("blocks a false claim while .bulkhead/ is unwritable (was silent ALLOW)", () => {
-    if (skipOnRoot) return;
+  it.skipIf(skipOnRoot)("blocks a false claim while .bulkhead/ is unwritable (was silent ALLOW)", () => {
     const repo = initRepo();
     try {
       recordFailingTests(repo);
@@ -322,8 +315,7 @@ describe("state-dir fail-closed on Stop (F2b, in-process hook)", () => {
     }
   });
 
-  it("stop_hook_active does not suppress the state-dir block (retry must not bypass)", () => {
-    if (skipOnRoot) return;
+  it.skipIf(skipOnRoot)("stop_hook_active does not suppress the state-dir block (retry must not bypass)", () => {
     const repo = initRepo();
     try {
       recordFailingTests(repo);
@@ -339,8 +331,7 @@ describe("state-dir fail-closed on Stop (F2b, in-process hook)", () => {
     }
   });
 
-  it("the verify guard comes back after restore (real enforcement, not just any block)", () => {
-    if (skipOnRoot) return;
+  it.skipIf(skipOnRoot)("the verify guard comes back after restore (real enforcement, not just any block)", () => {
     const repo = initRepo();
     try {
       recordFailingTests(repo);
@@ -358,8 +349,7 @@ describe("state-dir fail-closed on Stop (F2b, in-process hook)", () => {
 });
 
 describe("state-dir fail-closed on Stop (F2b, real CLI process)", () => {
-  it("hook protocol blocks while dark; verify guard returns after restore", () => {
-    if (skipOnRoot) return;
+  it.skipIf(skipOnRoot)("hook protocol blocks while dark; verify guard returns after restore", () => {
     const repo = initRepo();
     const post = spawnSync(
       "node",
